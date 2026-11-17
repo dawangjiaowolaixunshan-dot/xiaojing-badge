@@ -1,0 +1,7 @@
+# Same nvs/phy offsets as the Muse firmware it replaces, so its saved Wi-Fi
+# (namespace "homehub") is still there to read.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x11000,  0xC000,
+phy_init, data, phy,     0x1F000,  0x1000,
+factory,  app,  factory, 0x20000,  12M,
+storage,  data, spiffs,  0xC20000, 1M,

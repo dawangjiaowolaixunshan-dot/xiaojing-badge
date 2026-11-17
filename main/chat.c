@@ -1,0 +1,260 @@
+#include "chat.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "cJSON.h"
+#include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "history.h"
+#include "settings.h"
+
+static const char *TAG = "chat";
+#define URL "https://api.deepseek.com/chat/completions"
+#define MODEL "deepseek-chat"
+#define HISTORY 10          /* exchanges kept as context, in full */
+#define REPLY_CAP 4096
+#define TURN_CAP 1024
+
+/* Without a prompt of the user's own (tools/badge_setup.py prompt <file>). */
+static const char *DEFAULT_PROMPT = "你在一个挂在胸前的小圆屏吧唧里，屏幕很小，只能显示文字。";
+/* Always last: what the small screen can show. */
+static const char *FORMAT_RULES =
+    "\n\n输出要求：回答会被念出来，同时显示在小屏上。用简体中文口语；"
+    "简单的问题一两句话说完，复杂的问题可以讲清楚，但最多300字。"
+    "不要用Markdown、标题、列表符号、表格和表情符号，不要换行分段。";
+
+typedef struct {
+    char *q, *a;
+} turn_t;
+
+static turn_t s_hist[HISTORY];
+static int s_nhist;
+static volatile bool s_busy;
+static char *s_question, *s_reply, *s_line;
+static chat_text_cb_t s_on_text;
+static chat_done_cb_t s_on_done;
+
+static char *psram_strdup(const char *s, size_t cap)
+{
+    size_t n = strnlen(s, cap - 1);
+    char *d = heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (d) {
+        memcpy(d, s, n);
+        d[n] = '\0';
+    }
+    return d;
+}
+
+static void add_msg(cJSON *msgs, const char *role, const char *content)
+{
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", role);
+    cJSON_AddStringToObject(m, "content", content);
+    cJSON_AddItemToArray(msgs, m);
+}
+
+static char *build_body(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "model", MODEL);
+    cJSON_AddBoolToObject(root, "stream", true);
+    cJSON_AddNumberToObject(root, "max_tokens", 800);
+    cJSON *msgs = cJSON_AddArrayToObject(root, "messages");
+    char *custom = prompt_load();
+    const char *base = custom ? custom : DEFAULT_PROMPT;
+    size_t n = strlen(base) + strlen(FORMAT_RULES) + 1;
+    char *system = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    if (system) {
+        snprintf(system, n, "%s%s", base, FORMAT_RULES);
+        add_msg(msgs, "system", system);
+        free(system);
+    }
+    free(custom);
+    for (int i = 0; i < s_nhist; i++) {
+        add_msg(msgs, "user", s_hist[i].q);
+        add_msg(msgs, "assistant", s_hist[i].a);
+    }
+    add_msg(msgs, "user", s_question);
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return body;
+}
+
+/* One SSE line: "data: {...}" with choices[0].delta.content. */
+static void handle_line(const char *line, size_t *len)
+{
+    if (strncmp(line, "data: ", 6) || !strcmp(line + 6, "[DONE]")) return;
+    cJSON *root = cJSON_Parse(line + 6);
+    cJSON *choice = cJSON_GetArrayItem(cJSON_GetObjectItem(root, "choices"), 0);
+    const char *piece = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(choice, "delta"), "content"));
+    if (piece && *piece) {
+        size_t n = strlen(piece);
+        if (*len + n < REPLY_CAP) {
+            memcpy(s_reply + *len, piece, n);
+            *len += n;
+            s_reply[*len] = '\0';
+            if (s_on_text) s_on_text(s_reply);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+static void remember(void)
+{
+    if (s_nhist == HISTORY) {
+        free(s_hist[0].q);
+        free(s_hist[0].a);
+        memmove(&s_hist[0], &s_hist[1], (HISTORY - 1) * sizeof(turn_t));
+        s_nhist--;
+    }
+    s_hist[s_nhist].q = psram_strdup(s_question, TURN_CAP);
+    s_hist[s_nhist].a = psram_strdup(s_reply, REPLY_CAP);
+    if (s_hist[s_nhist].q && s_hist[s_nhist].a) s_nhist++;
+}
+
+static void forget_all(void)
+{
+    for (int i = 0; i < s_nhist; i++) {
+        free(s_hist[i].q);
+        free(s_hist[i].a);
+    }
+    s_nhist = 0;
+}
+
+static void restore_one(const char *q, const char *a, void *ctx)
+{
+    if (!q) {   /* a new conversation began here */
+        forget_all();
+        return;
+    }
+    strlcpy(s_question, q, TURN_CAP);
+    strlcpy(s_reply, a, REPLY_CAP);
+    remember();
+}
+
+void chat_restore(void)
+{
+    if (!s_reply) {
+        s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
+        s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
+        s_line = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    }
+    history_each(HISTORY_SHOW, restore_one, NULL);
+    s_reply[0] = s_question[0] = '\0';
+    ESP_LOGI(TAG, "%d exchanges of context restored", s_nhist);
+}
+
+static void chat_task(void *arg)
+{
+    const char *error = NULL;
+    static char err_buf[48];
+    char *auth = heap_caps_malloc(300, MALLOC_CAP_SPIRAM);
+    char *key = heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
+    char *body = build_body();
+    char *buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    size_t reply_len = 0, line_len = 0;
+    s_reply[0] = '\0';
+    settings_get_key(KEY_DEEPSEEK, key, 256);
+    snprintf(auth, 300, "Bearer %s", key);
+    memset(key, 0, 256);
+
+    esp_http_client_config_t cfg = {
+        .url = URL,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 30000,
+        .buffer_size = 2048,
+        .buffer_size_tx = 1024,
+    };
+    esp_http_client_handle_t http = esp_http_client_init(&cfg);
+    esp_http_client_set_header(http, "Authorization", auth);
+    esp_http_client_set_header(http, "Content-Type", "application/json");
+    esp_http_client_set_header(http, "Accept", "text/event-stream");
+    int64_t t0 = esp_log_timestamp();
+    int body_len = strlen(body);
+    if (esp_http_client_open(http, body_len) != ESP_OK ||
+        esp_http_client_write(http, body, body_len) != body_len) {
+        error = "连不上 DeepSeek";
+        goto done;
+    }
+    esp_http_client_fetch_headers(http);
+    int status = esp_http_client_get_status_code(http);
+    if (status != 200) {
+        int n = esp_http_client_read(http, buf, 1023);
+        buf[n > 0 ? n : 0] = '\0';
+        ESP_LOGE(TAG, "HTTP %d: %.200s", status, buf);
+        snprintf(err_buf, sizeof(err_buf), status == 401 ? "DeepSeek 密钥不对 (401)" :
+                 status == 402 ? "DeepSeek 余额不足 (402)" : "DeepSeek 出错了 (%d)", status);
+        error = err_buf;
+        goto done;
+    }
+    bool first = true;
+    for (;;) {
+        int n = esp_http_client_read(http, buf, 1024);
+        if (n <= 0) break;
+        if (first) {
+            ESP_LOGI(TAG, "first bytes after %d ms", (int)(esp_log_timestamp() - t0));
+            first = false;
+        }
+        for (int i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n') {
+                s_line[line_len] = '\0';
+                handle_line(s_line, &reply_len);
+                line_len = 0;
+            } else if (c != '\r' && line_len < 4095) {
+                s_line[line_len++] = c;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "reply %d bytes in %d ms", (int)reply_len, (int)(esp_log_timestamp() - t0));
+    if (!reply_len) {
+        error = "DeepSeek 没有回答";
+    } else {
+        remember();
+        history_add(s_question, s_reply);
+    }
+done:
+    esp_http_client_cleanup(http);
+    memset(auth, 0, 300);
+    free(auth);
+    free(key);
+    free(buf);
+    cJSON_free(body);
+    s_busy = false;
+    if (s_on_done) s_on_done(error);
+    vTaskDelete(NULL);
+}
+
+bool chat_ask(const char *question, chat_text_cb_t on_text, chat_done_cb_t on_done)
+{
+    if (s_busy) return false;
+    if (!s_reply) {
+        s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
+        s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
+        s_line = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    }
+    strlcpy(s_question, question, TURN_CAP);
+    s_on_text = on_text;
+    s_on_done = on_done;
+    s_busy = true;
+    if (xTaskCreatePinnedToCore(chat_task, "chat", 8192, NULL, 5, NULL, 0) != pdPASS) {
+        s_busy = false;
+        return false;
+    }
+    return true;
+}
+
+void chat_reset(void)
+{
+    if (s_busy) return;
+    forget_all();
+    history_divider();
+}
+
+bool chat_busy(void) { return s_busy; }

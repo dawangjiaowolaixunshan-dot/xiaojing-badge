@@ -1,0 +1,7 @@
+idf_component_register(
+    SRCS "app_main.c" "settings.c" "net.c" "console.c" "poems.c" "ui.c" "ui_poem.c" "ui_chat.c"
+         "mic.c" "asr.c" "chat.c" "history.c" "tts.c" "whale_img.c" "pmu.c" "fonts/font_poem_32.c" "fonts/font_text_22.c"
+    INCLUDE_DIRS "."
+    EMBED_TXTFILES "data/poems.txt"
+    REQUIRES spiffs nvs_flash esp_wifi esp_netif esp_event esp_http_client esp-tls esp_timer
+             esp_driver_usb_serial_jtag esp_driver_gpio)
