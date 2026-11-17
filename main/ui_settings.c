@@ -1,0 +1,236 @@
+/*
+ * 设置: brightness, volume, reading aloud and its voice, when the screen
+ * turns off, then battery and network, restart and power off. One column
+ * that scrolls; changes apply at once and are saved.
+ */
+#include <stdio.h>
+#include <string.h>
+
+#include "bsp/display.h"
+#include "chat.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "net.h"
+#include "pmu.h"
+#include "prefs.h"
+#include "settings.h"
+#include "tts.h"
+#include "ui.h"
+
+#define COL_W 300
+
+static lv_obj_t *s_col, *s_cur, *s_sleep_btn_lbl;   /* s_cur: the card being filled */
+
+/* A rounded card holding one group of settings, titled. */
+static lv_obj_t *card(const char *title)
+{
+    s_cur = lv_obj_create(s_col);
+    lv_obj_remove_style_all(s_cur);
+    lv_obj_set_size(s_cur, COL_W, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_cur, lv_color_hex(0x0e1320), 0);
+    lv_obj_set_style_bg_opa(s_cur, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_cur, lv_color_hex(0x1d2638), 0);
+    lv_obj_set_style_border_width(s_cur, 1, 0);
+    lv_obj_set_style_radius(s_cur, 20, 0);
+    lv_obj_set_style_pad_all(s_cur, 12, 0);
+    lv_obj_set_style_pad_row(s_cur, 6, 0);
+    lv_obj_set_flex_flow(s_cur, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_cur, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(s_cur, LV_OBJ_FLAG_SCROLLABLE);
+    if (title) ui_label(s_cur, &g_font_text, 0x8fa3c8, title);
+    return s_cur;
+}
+
+static lv_obj_t *row_title(const char *text)
+{
+    lv_obj_t *l = ui_label(s_cur, &g_font_text, C_DIM, text);
+    lv_obj_set_style_margin_top(l, 4, 0);
+    return l;
+}
+
+static lv_obj_t *slider(int value, int min, lv_event_cb_t cb)
+{
+    lv_obj_t *s = lv_slider_create(s_cur);
+    lv_obj_set_width(s, COL_W - 60);
+    lv_obj_set_height(s, 14);
+    lv_slider_set_range(s, min, 100);
+    lv_slider_set_value(s, value, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x2a2a32), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s, 6, LV_PART_KNOB);
+    lv_obj_set_style_margin_ver(s, 8, 0);
+    lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s, cb, LV_EVENT_RELEASED, NULL);
+    return s;
+}
+
+static void on_brightness(lv_event_t *e)
+{
+    g_prefs.brightness = lv_slider_get_value(lv_event_get_target(e));
+    bsp_display_brightness_set(g_prefs.brightness);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) prefs_save();
+}
+
+static void on_volume(lv_event_t *e)
+{
+    g_prefs.volume = lv_slider_get_value(lv_event_get_target(e));
+    tts_set_volume(g_prefs.volume);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) prefs_save();
+}
+
+static void on_read(lv_event_t *e)
+{
+    tts_set_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+/* ---- choosing a voice: a list, a tap picks one and plays it ---- */
+
+static uint8_t *s_pick;   /* &g_prefs.voice or &g_prefs.poem_voice */
+
+static void on_pick(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    *s_pick = (uint8_t)i;
+    prefs_save();
+    if (s_pick == &g_prefs.voice) tts_set_voice(PREFS_VOICES[i]);
+    lv_obj_t *list = lv_obj_get_parent(lv_event_get_target(e));
+    for (uint32_t k = 0; k < lv_obj_get_child_count(list); k++) {
+        lv_obj_t *c = lv_obj_get_child(list, k);
+        if (lv_obj_check_type(c, &lv_button_class)) {
+            lv_obj_set_style_bg_color(c, lv_color_hex(c == lv_event_get_target(e) ? C_BLUE : C_PANEL), 0);
+        }
+    }
+    tts_say_with(PREFS_VOICES[i], s_pick == &g_prefs.voice ? "你好呀，我是小鲸，以后就用这个声音跟你聊天。"
+                                                            : "床前明月光，疑是地上霜。举头望明月，低头思故乡。");
+}
+
+static void open_picker(uint8_t *which, const char *title)
+{
+    s_pick = which;
+    lv_obj_t *scr = ui_screen();
+    ui_back_button(scr);
+    lv_obj_t *list = lv_obj_create(scr);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 300, 466);
+    lv_obj_center(list);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(list, 60, 0);
+    lv_obj_set_style_pad_bottom(list, 100, 0);
+    lv_obj_set_style_pad_row(list, 8, 0);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+    ui_label(list, &g_font_text, C_ACCENT, title);
+    ui_label(list, &g_font_text, C_DIM, "点一个就选中，并试听");
+    lv_obj_t *mine = NULL;
+    for (int i = 0; i < PREFS_VOICE_N; i++) {
+        lv_obj_t *b = ui_button(list, PREFS_VOICE_NAMES[i], &g_font_text, 270, 50, i == *which ? C_BLUE : C_PANEL,
+                                on_pick, (void *)(intptr_t)i);
+        if (i == *which) mine = b;
+    }
+    ui_show(scr, ui_settings, NULL);
+    if (mine) lv_obj_scroll_to_view(mine, LV_ANIM_OFF);
+}
+
+static void on_chat_voice(lv_event_t *e) { open_picker(&g_prefs.voice, "小鲸聊天的音色"); }
+static void on_poem_voice(lv_event_t *e) { open_picker(&g_prefs.poem_voice, "古诗朗读的音色"); }
+
+static void on_sleep(lv_event_t *e)
+{
+    g_prefs.sleep = (g_prefs.sleep + 1) % PREFS_SLEEP_N;
+    lv_label_set_text(s_sleep_btn_lbl, PREFS_SLEEP_NAMES[g_prefs.sleep]);
+    prefs_save();
+}
+
+static void on_restart(lv_event_t *e) { esp_restart(); }
+
+static void on_new_chat(lv_event_t *e)
+{
+    chat_reset();   /* 小鲸 forgets this conversation; the record stays */
+    lv_label_set_text(lv_obj_get_child(lv_event_get_target(e), 0), "已开始新对话");
+}
+static void on_power_off(lv_event_t *e) { pmu_power_off(); }
+
+static lv_obj_t *pill(const char *text, uint32_t bg, lv_event_cb_t cb, lv_obj_t **label)
+{
+    lv_obj_t *b = ui_button(s_cur, NULL, &g_font_text, 240, 46, bg, cb, NULL);
+    lv_obj_set_style_margin_ver(b, 4, 0);
+    lv_obj_t *l = ui_label(b, &g_font_text, 0xffffff, text);
+    lv_obj_center(l);
+    if (label) *label = l;
+    return b;
+}
+
+void ui_settings(void)
+{
+    char buf[96];
+    lv_obj_t *scr = ui_screen();
+    ui_back_button(scr);
+
+    s_col = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_col);
+    lv_obj_set_size(s_col, COL_W, 466);
+    lv_obj_center(s_col);
+    lv_obj_set_flex_flow(s_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(s_col, 60, 0);
+    lv_obj_set_style_pad_bottom(s_col, 90, 0);
+    lv_obj_set_style_pad_row(s_col, 10, 0);
+    lv_obj_set_scroll_dir(s_col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_col, LV_SCROLLBAR_MODE_OFF);
+
+    ui_label(s_col, &g_font_poem, C_ACCENT, "设置");
+
+    int pct;
+    bool charging, usb;
+    pmu_read(&pct, &charging, &usb);
+    if (pct >= 0) snprintf(buf, sizeof(buf), "电量 %d%%%s", pct, charging ? "，充电中" : usb ? "，已插电" : "");
+    else snprintf(buf, sizeof(buf), "%s", usb ? "USB 供电" : "电量未知");
+    card(NULL);
+    ui_label(s_cur, &g_font_text, C_TEXT, buf);
+
+    card("屏幕和声音");
+    row_title("亮度");
+    slider(g_prefs.brightness, 10, on_brightness);
+    row_title("音量");
+    slider(g_prefs.volume, 0, on_volume);
+
+    card("说话");
+    pill(LV_SYMBOL_REFRESH "  开始新对话", C_PANEL, on_new_chat, NULL);
+    row_title("朗读回答");
+    lv_obj_t *sw = lv_switch_create(s_cur);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(C_GREEN), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (tts_enabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, on_read, LV_EVENT_VALUE_CHANGED, NULL);
+
+    row_title("小鲸聊天音色");
+    pill(PREFS_VOICE_NAMES[g_prefs.voice], C_BLUE, on_chat_voice, NULL);
+    row_title("古诗朗读音色");
+    pill(PREFS_VOICE_NAMES[g_prefs.poem_voice], C_ACCENT, on_poem_voice, NULL);
+
+    card("省电");
+    row_title("自动熄屏（点一下换）");
+    pill(PREFS_SLEEP_NAMES[g_prefs.sleep], C_PANEL, on_sleep, &s_sleep_btn_lbl);
+
+    card("网络");
+    char ssid[33] = "", pass[65];
+    settings_get_wifi(net_slot(), ssid, sizeof(ssid), pass, sizeof(pass));
+    memset(pass, 0, sizeof(pass));
+    if (net_up()) {
+        esp_netif_ip_info_t ip = {0};
+        esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
+        snprintf(buf, sizeof(buf), "%s%s\n信号 %d · " IPSTR, ssid, net_slot() ? "（手机热点）" : "",
+                 net_rssi(), IP2STR(&ip.ip));
+    } else {
+        snprintf(buf, sizeof(buf), "%s\n没有连上", ssid[0] ? ssid : "没设置 Wi-Fi");
+    }
+    lv_obj_t *n = ui_label(s_cur, &g_font_text, C_TEXT, buf);
+    lv_obj_set_style_text_align(n, LV_TEXT_ALIGN_CENTER, 0);
+
+    card(NULL);
+    pill("重启", C_PANEL, on_restart, NULL);
+    pill("关机", C_RED, on_power_off, NULL);
+
+    ui_show(scr, ui_home, NULL);
+}

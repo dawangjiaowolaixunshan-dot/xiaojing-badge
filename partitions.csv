@@ -5,3 +5,5 @@ nvs,      data, nvs,     0x11000,  0xC000,
 phy_init, data, phy,     0x1F000,  0x1000,
 factory,  app,  factory, 0x20000,  12M,
 storage,  data, spiffs,  0xC20000, 1M,
+# The whale girl's animation frames (tools/make_pet.py -> pet.bin), read in place.
+pet,      data, 0x40,    0xD20000, 16M,

@@ -22,3 +22,10 @@ void history_dump(void (*line_fn)(const char *line));
 #define PROMPT_MAX (16 * 1024)
 char *prompt_load(void);                    /* free() it */
 bool prompt_save(const char *text, size_t len);   /* len 0 removes it */
+
+/* Recall: the record kept in PSRAM too, and searched by a question's words
+ * for past exchanges about the same thing (beyond the newest skip_newest,
+ * which are in the context already). Writes "问：… 答：…" lines. */
+void history_recall_init(void);
+void history_recall_add(const char *q, const char *a);
+size_t history_recall(const char *question, int skip_newest, char *out, size_t cap);

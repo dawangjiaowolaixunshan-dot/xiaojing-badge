@@ -1,9 +1,11 @@
 #include "console.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -11,6 +13,9 @@
 #include "freertos/task.h"
 #include "history.h"
 #include "net.h"
+#include "pet.h"
+#include "prefs.h"
+#include "tts.h"
 #include "settings.h"
 #include "ui.h"
 
@@ -88,15 +93,18 @@ static void handle(char *line)
         bool ok = settings_set_key(id, line + 7);
         printf("@%s %.6s\n", ok ? "ok" : "fail", line);
         ui_settings_changed();
-    } else if (!strncmp(line, "wifi=", 5)) {
-        char *ssid = line + 5, *tab = strchr(ssid, '\t');
+    } else if (!strncmp(line, "wifi=", 5) || !strncmp(line, "wifi2=", 6)) {
+        int slot = line[4] == '2';
+        const char *tag = slot ? "wifi2" : "wifi";
+        char *ssid = line + (slot ? 6 : 5), *tab = strchr(ssid, '\t');
         if (!tab) {
-            printf("@fail wifi (ssid<TAB>password)\n");
+            printf("@fail %s (ssid<TAB>password)\n", tag);
             return;
         }
         *tab = '\0';
-        bool ok = settings_set_wifi(ssid, tab + 1);
-        printf("@%s wifi\n", ok ? "ok" : "fail");
+        bool ok = settings_set_wifi(slot, ssid, tab + 1);
+        wipe(tab + 1, strlen(tab + 1));
+        printf("@%s %s\n", ok ? "ok" : "fail", tag);
         if (ok) {
             net_reconnect();
         }
@@ -104,11 +112,12 @@ static void handle(char *line)
         char *v = heap_caps_malloc(CMD_LINE_MAX, MALLOC_CAP_SPIRAM);
         char pass[65];
         if (!v) return;
-        printf("@keys ds_key=%s bl_key=%s wifi=%s net=%s\n",
+        printf("@keys ds_key=%s bl_key=%s wifi=%s wifi2=%s net=%s\n",
                settings_get_key(KEY_DEEPSEEK, v, CMD_LINE_MAX) ? "set" : "unset",
                settings_get_key(KEY_BAILIAN, v, CMD_LINE_MAX) ? "set" : "unset",
-               settings_get_wifi(v, 33, pass, sizeof(pass)) ? "set" : "unset",
-               net_up() ? "up" : "down");
+               settings_get_wifi(0, v, 33, pass, sizeof(pass)) ? "set" : "unset",
+               settings_get_wifi(1, v, 33, pass, sizeof(pass)) ? "set" : "unset",
+               !net_up() ? "down" : net_slot() ? "hotspot" : "home");
         wipe(v, CMD_LINE_MAX);
         wipe(pass, sizeof(pass));
         free(v);
@@ -138,12 +147,55 @@ static void handle(char *line)
         s_dump_n = 0;
         history_dump(dump_line);
         printf("@h_end %d\n", s_dump_n);
-    } else if (!strcmp(line, "screen=chat") || !strcmp(line, "screen=home")) {   /* for testing over USB */
+    } else if (!strncmp(line, "screen=", 7)) {   /* for testing over USB */
         ui_lock();
-        if (line[7] == 'c') ui_chat();
+        if (!strcmp(line + 7, "chat")) ui_chat();
+        else if (!strcmp(line + 7, "settings")) ui_settings();
+        else if (!strcmp(line + 7, "poem")) ui_poem_home();
         else ui_home();
         ui_unlock();
         printf("@ok screen\n");
+    } else if (!strncmp(line, "voicetest=", 10)) {   /* speak a line in voice N, to check the id works */
+        int i = atoi(line + 10);
+        if (i >= 0 && i < PREFS_VOICE_N) tts_say_with(PREFS_VOICES[i], "你好");
+        printf("@ok voicetest %d\n", i);
+    } else if (!strcmp(line, "shot")) {   /* the screen as RGB565, base64, for tools/badge_shot.py */
+        ui_lock();
+        lv_draw_buf_t *snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+        ui_unlock();
+        if (!snap) {
+            printf("@shot_fail\n");
+            return;
+        }
+        int w = snap->header.w, h = snap->header.h, stride = snap->header.stride;
+        printf("@shot %d %d\n", w, h);
+        static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        static char out[1300];   /* a 466-px row: 932 bytes, 1244 in base64 */
+        for (int y = 0; y < h; y++) {
+            const uint8_t *row = snap->data + y * stride;
+            int n = w * 2, o = 0;
+            for (int i = 0; i < n; i += 3) {
+                uint32_t v = row[i] << 16 | (i + 1 < n ? row[i + 1] << 8 : 0) | (i + 2 < n ? row[i + 2] : 0);
+                out[o++] = T[v >> 18 & 63];
+                out[o++] = T[v >> 12 & 63];
+                out[o++] = i + 1 < n ? T[v >> 6 & 63] : '=';
+                out[o++] = i + 2 < n ? T[v & 63] : '=';
+                if (o > (int)sizeof(out) - 8) break;
+            }
+            out[o] = 0;
+            printf("@r %d %s\n", y, out);
+            if (y % 8 == 0) vTaskDelay(1);
+        }
+        printf("@shot_end\n");
+        lv_draw_buf_destroy(snap);
+    } else if (!strcmp(line, "poemread")) {
+        ui_lock();
+        ui_poem_read();
+        ui_unlock();
+    } else if (!strcmp(line, "petdbg")) {
+        ui_lock();
+        pet_debug();
+        ui_unlock();
     } else if (!strcmp(line, "reboot")) {
         esp_restart();
     }
@@ -173,9 +225,16 @@ void console_start(void)
 {
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     cfg.rx_buffer_size = 1024;
+    cfg.tx_buffer_size = 4096;
     if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
         ESP_LOGW(TAG, "no USB serial driver; setup commands unavailable");
         return;
     }
-    xTaskCreate(console_task, "console", 4096, NULL, 3, NULL);
+    /* Logs and printf through the driver too. Left on the default direct
+     * path, they fought the driver for the same FIFO: under a big output
+     * (a screenshot) the port wedged, and every task that logged hung with
+     * it (the chat stopped showing text, the UI stalled). The driver path
+     * drops output after 50 ms with no host instead of blocking. */
+    usb_serial_jtag_vfs_use_driver();
+    xTaskCreate(console_task, "console", 8192, NULL, 3, NULL);   /* >shot takes a snapshot on this stack */
 }

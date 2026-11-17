@@ -60,23 +60,33 @@ bool settings_set_key(key_id_t id, const char *value)
     return id < KEY_COUNT && set_str(KEY_NAMES[id], value);
 }
 
-bool settings_get_wifi(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
+/* Slot 0 is the home network, slot 1 the phone hotspot. */
+static const char *SSID_KEY[2] = {"ssid", "ssid2"};
+static const char *PASS_KEY[2] = {"pass", "pass2"};
+
+bool settings_get_wifi(int slot, char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
 {
     pass[0] = '\0';
-    if (get_str(NS, "ssid", ssid, ssid_cap)) {
-        get_str(NS, "pass", pass, pass_cap);
+    if (slot < 0 || slot > 1) {
+        return false;
+    }
+    if (get_str(NS, SSID_KEY[slot], ssid, ssid_cap)) {
+        get_str(NS, PASS_KEY[slot], pass, pass_cap);
         return true;
     }
-    if (get_str("homehub", "ssid", ssid, ssid_cap)) {   /* left by the Muse firmware */
+    if (slot == 0 && get_str("homehub", "ssid", ssid, ssid_cap)) {   /* left by the Muse firmware */
         get_str("homehub", "password", pass, pass_cap);
         return true;
     }
     return false;
 }
 
-bool settings_set_wifi(const char *ssid, const char *pass)
+bool settings_set_wifi(int slot, const char *ssid, const char *pass)
 {
-    return set_str("ssid", ssid) && set_str("pass", pass);
+    if (slot < 0 || slot > 1) {
+        return false;
+    }
+    return set_str(SSID_KEY[slot], ssid) && set_str(PASS_KEY[slot], ssid[0] ? pass : "");
 }
 
 bool settings_get_blob(const char *name, void *out, size_t len)

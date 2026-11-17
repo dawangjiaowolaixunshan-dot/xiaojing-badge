@@ -7,18 +7,23 @@
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/touch.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
+#include "chat.h"
 #include "net.h"
+#include "pet.h"
+#include "prefs.h"
+#include "tts.h"
 
 static const char *TAG = "ui";
 LV_FONT_DECLARE(font_text_22)
 LV_FONT_DECLARE(font_poem_32)
-lv_font_t g_font_text, g_font_poem;
+LV_FONT_DECLARE(font_clock_60)
+lv_font_t g_font_text, g_font_poem, g_font_clock;
 
 static void (*s_back)(void);
 static void (*s_talk)(bool);
-static lv_obj_t *s_home_status;
 
 bool ui_lock(void) { return esp_lv_adapter_lock(-1) == ESP_OK; }
 void ui_unlock(void) { esp_lv_adapter_unlock(); }
@@ -36,7 +41,6 @@ void ui_show(lv_obj_t *scr, void (*back)(void), void (*talk)(bool pressed))
 {
     s_back = back;
     s_talk = talk;
-    s_home_status = NULL;
     lv_screen_load_anim(scr, LV_SCREEN_LOAD_ANIM_FADE_IN, 150, 0, true);
 }
 
@@ -78,9 +82,68 @@ void ui_back_button(lv_obj_t *scr)
     lv_obj_set_ext_click_area(b, 12);
 }
 
+/* ---- Screen off when idle ---- */
+
+static bool s_asleep, s_dimmed;
+static esp_lcd_panel_handle_t s_panel;   /* set by display_start() */
+static lv_obj_t *s_wake_cover;   /* catches the touch that wakes, so it presses nothing */
+
+static void wake(void)
+{
+    lv_display_trigger_activity(NULL);
+    if (s_wake_cover) {
+        lv_obj_delete(s_wake_cover);
+        s_wake_cover = NULL;
+    }
+    if (s_asleep && s_panel) esp_lcd_panel_disp_on_off(s_panel, true);
+    if (s_asleep || s_dimmed) bsp_display_brightness_set(g_prefs.brightness);
+    if (s_asleep) pet_set_paused(false);
+    s_asleep = s_dimmed = false;
+}
+
+static void on_wake_cover(lv_event_t *e) { wake(); }
+
+static void sleep_timer(lv_timer_t *t)
+{
+    /* Talking, thinking or reading aloud counts as use. */
+    if (chat_busy() || tts_active() || ui_chat_listening()) lv_display_trigger_activity(NULL);
+    int limit = PREFS_SLEEP_S[g_prefs.sleep] * 1000;
+    uint32_t idle = lv_display_get_inactive_time(NULL);
+    if (!limit || idle < 1000) {
+        if ((s_asleep || s_dimmed) && idle < 1000) wake();
+        return;
+    }
+    if (!s_asleep && idle >= (uint32_t)limit) {
+        s_asleep = true;
+        bsp_display_brightness_set(0);
+        if (s_panel) esp_lcd_panel_disp_on_off(s_panel, false);   /* the panel itself off, not just dark */
+        pet_set_paused(true);                                     /* and no frames drawn for nobody */
+        s_wake_cover = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(s_wake_cover);
+        lv_obj_set_size(s_wake_cover, LV_PCT(100), LV_PCT(100));
+        lv_obj_add_flag(s_wake_cover, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_wake_cover, on_wake_cover, LV_EVENT_PRESSED, NULL);
+    } else if (!s_asleep && !s_dimmed && idle >= (uint32_t)limit - 8000) {
+        s_dimmed = true;   /* a warning: it goes dark in a few seconds */
+        bsp_display_brightness_set(g_prefs.brightness / 4 + 3);
+    }
+}
+
+/* A key on a dark screen only wakes it. */
+static bool woke_by_key(void)
+{
+    bool was = s_asleep;
+    wake();
+    return was;
+}
+
 void ui_boot_button(bool pressed)
 {
     if (!ui_lock()) return;
+    if (woke_by_key()) {
+        ui_unlock();
+        return;
+    }
     if (!pressed && s_back) s_back();
     ui_unlock();
 }
@@ -88,50 +151,16 @@ void ui_boot_button(bool pressed)
 void ui_talk_button(bool pressed)
 {
     if (!ui_lock()) return;
+    if (pressed && woke_by_key()) {
+        ui_unlock();
+        return;
+    }
     if (s_talk) {
         s_talk(pressed);
     } else if (pressed && !s_back) {
         ui_chat();   /* on the home screen, PWR goes to DeepSeek */
     }
     ui_unlock();
-}
-
-/* ---- Home ---- */
-
-static void update_home(void)
-{
-    if (!s_home_status) return;
-    char buf[64];
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    if (net_time_valid()) {
-        snprintf(buf, sizeof(buf), "%s  %02d:%02d", net_up() ? LV_SYMBOL_WIFI : "没有网络", tm.tm_hour, tm.tm_min);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", net_up() ? LV_SYMBOL_WIFI : "连接网络中…");
-    }
-    lv_label_set_text(s_home_status, buf);
-}
-
-static void home_timer(lv_timer_t *t) { update_home(); }
-
-static void go_chat(lv_event_t *e) { ui_chat(); }
-static void go_poem(lv_event_t *e) { ui_poem_home(); }
-
-void ui_home(void)
-{
-    lv_obj_t *scr = ui_screen();
-    lv_obj_t *status = ui_label(scr, &g_font_text, C_DIM, "");
-    lv_obj_align(status, LV_ALIGN_CENTER, 0, -176);
-
-    lv_obj_t *b = ui_button(scr, "DeepSeek", &g_font_poem, 280, 104, C_BLUE, go_chat, NULL);
-    lv_obj_align(b, LV_ALIGN_CENTER, 0, -62);
-    b = ui_button(scr, "古诗", &g_font_poem, 280, 104, C_ACCENT, go_poem, NULL);
-    lv_obj_align(b, LV_ALIGN_CENTER, 0, 66);
-
-    ui_show(scr, NULL, NULL);
-    s_home_status = status;
-    update_home();
 }
 
 void ui_settings_changed(void)
@@ -176,6 +205,7 @@ static lv_display_t *display_start(void)
         .max_transfer_sz = BSP_LCD_H_RES * DRAW_ROWS * 2,
     };
     if (bsp_display_new(&panel_cfg, &panel, &io) != ESP_OK) return NULL;
+    s_panel = panel;
     esp_lv_adapter_display_config_t disp_cfg = {
         .panel = panel,
         .panel_io = io,
@@ -210,6 +240,7 @@ void ui_start(void)
 {
     set_metrics(&g_font_text, &font_text_22, 27, 6);
     set_metrics(&g_font_poem, &font_poem_32, 38, 9);
+    g_font_clock = font_clock_60;
     lv_display_t *disp = display_start();
     if (!disp) {
         ESP_LOGE(TAG, "display start failed");
@@ -217,7 +248,9 @@ void ui_start(void)
     }
     ui_lock();
     lv_obj_set_style_bg_color(lv_layer_bottom(), lv_color_black(), 0);
+    prefs_load();
+    prefs_apply();
     ui_home();
-    lv_timer_create(home_timer, 5000, NULL);
+    lv_timer_create(sleep_timer, 500, NULL);
     ui_unlock();
 }

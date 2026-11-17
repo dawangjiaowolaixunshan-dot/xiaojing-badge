@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "chat.h"
@@ -13,10 +14,13 @@
 #include "mic.h"
 #include "net.h"
 #include "pmu.h"
+#include "prefs.h"
+#include "pet.h"
 #include "poems.h"
 #include "settings.h"
 #include "tts.h"
 #include "ui.h"
+#include "weather.h"
 
 static const char *TAG = "app";
 #define BOOT_GPIO GPIO_NUM_0
@@ -91,18 +95,26 @@ static void heartbeat_task(void *arg)
 
 void app_main(void)
 {
+    /* 240 MHz when busy, 80 MHz when idle; no light sleep (it would cut the
+     * USB console and the display's refresh). */
+    esp_pm_config_t pm = {.max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false};
+    if (esp_pm_configure(&pm) != ESP_OK) ESP_LOGW(TAG, "no frequency scaling");
     settings_init();
     poems_init();
+    pet_init();
     history_init();
     chat_restore();
+    history_recall_init();
     ui_start();
     pmu_init();
     console_start();
     net_start();
+    weather_start();
     if (!mic_init()) {
         ESP_LOGE(TAG, "no microphone: DeepSeek can't listen");
     }
     tts_init();
+    prefs_apply();   /* again now the speaker is up: its volume */
     xTaskCreate(button_task, "buttons", 3072, NULL, 4, NULL);
     xTaskCreate(heartbeat_task, "heartbeat", 3072, NULL, 1, NULL);
     ESP_LOGI(TAG, "up");

@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+void history_recall_add(const char *q, const char *a);
+
 static const char *TAG = "history";
 #define PATH "/hist/chat.jsonl"
 #define TMP "/hist/chat.tmp"
@@ -110,6 +112,7 @@ void history_add(const char *q, const char *a)
     trim();
     xSemaphoreGive(s_mu);
     cJSON_free(line);
+    history_recall_add(q, a);
 }
 
 void history_divider(void)
@@ -202,4 +205,114 @@ void history_dump(void (*line_fn)(const char *line))
     if (f) fclose(f);
     free(line);
     xSemaphoreGive(s_mu);
+}
+
+/* ---- recall: the whole record in PSRAM, searched for what a question is about ---- */
+
+#define MEM_MAX 1000
+typedef struct {
+    char *q, *a;
+} mem_t;
+static mem_t *s_mem;     /* a ring of the newest MEM_MAX exchanges */
+static int s_mem_n, s_mem_head;
+
+static void mem_push(const char *q, const char *a)
+{
+    if (!s_mem) s_mem = heap_caps_calloc(MEM_MAX, sizeof(mem_t), MALLOC_CAP_SPIRAM);
+    if (!s_mem) return;
+    int slot = (s_mem_head + s_mem_n) % MEM_MAX;
+    if (s_mem_n == MEM_MAX) {   /* full: drop the oldest */
+        free(s_mem[s_mem_head].q);
+        free(s_mem[s_mem_head].a);
+        s_mem_head = (s_mem_head + 1) % MEM_MAX;
+        slot = (s_mem_head + s_mem_n - 1) % MEM_MAX;
+    } else {
+        s_mem_n++;
+    }
+    size_t nq = strlen(q), na = strlen(a);
+    s_mem[slot].q = heap_caps_malloc(nq + 1, MALLOC_CAP_SPIRAM);
+    s_mem[slot].a = heap_caps_malloc(na + 1, MALLOC_CAP_SPIRAM);
+    if (s_mem[slot].q) memcpy(s_mem[slot].q, q, nq + 1);
+    if (s_mem[slot].a) memcpy(s_mem[slot].a, a, na + 1);
+}
+
+static void mem_load_one(const char *q, const char *a, void *ctx)
+{
+    if (q) mem_push(q, a);
+}
+
+void history_recall_init(void)
+{
+    history_each(MEM_MAX, mem_load_one, NULL);
+    ESP_LOGI(TAG, "%d exchanges to recall from", s_mem_n);
+}
+
+void history_recall_add(const char *q, const char *a) { mem_push(q, a); }
+
+/* The question's two-character words (CJK only), less the ones every
+ * question has. */
+#define MAX_PAIRS 40
+static int pairs_of(const char *text, char pairs[][7])
+{
+    static const char *COMMON[] = {"什么", "为什", "怎么", "一下", "我们", "你们", "是不", "不是", "可以",
+                                   "这个", "那个", "知道", "现在", "今天", "有没", "没有", "一个", "的时",
+                                   "时候", "你说", "我说", "告诉", "为啥", "是什"};
+    int n = 0;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p && n < MAX_PAIRS) {
+        /* a CJK ideograph is three bytes starting 0xE4..0xE9 */
+        if (p[0] >= 0xE4 && p[0] <= 0xE9 && p[1] && p[2] && p[3] >= 0xE4 && p[3] <= 0xE9 && p[4] && p[5]) {
+            memcpy(pairs[n], p, 6);
+            pairs[n][6] = '\0';
+            bool common = false;
+            for (size_t k = 0; k < sizeof(COMMON) / sizeof(COMMON[0]); k++) {
+                if (!strcmp(pairs[n], COMMON[k])) common = true;
+            }
+            if (!common) n++;
+            p += 3;
+        } else {
+            p += *p < 0x80 ? 1 : *p < 0xE0 ? 2 : *p < 0xF0 ? 3 : 4;
+        }
+    }
+    return n;
+}
+
+size_t history_recall(const char *question, int skip_newest, char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (!s_mem || !s_mem_n) return 0;
+    char pairs[MAX_PAIRS][7];
+    int np = pairs_of(question, pairs);
+    if (np == 0) return 0;
+    int best[3] = {-1, -1, -1}, best_s[3] = {0, 0, 0};
+    for (int i = 0; i < s_mem_n - skip_newest; i++) {
+        const mem_t *m = &s_mem[(s_mem_head + i) % MEM_MAX];
+        if (!m->q || !m->a) continue;
+        int score = 0;
+        for (int k = 0; k < np; k++) {
+            if (strstr(m->q, pairs[k])) score += 2;   /* a match in what was asked counts more */
+            else if (strstr(m->a, pairs[k])) score += 1;
+        }
+        for (int r = 0; r < 3; r++) {
+            if (score > best_s[r] || (score == best_s[r] && score > 0 && i > best[r])) {   /* ties: the newer */
+                for (int t = 2; t > r; t--) {
+                    best[t] = best[t - 1];
+                    best_s[t] = best_s[t - 1];
+                }
+                best[r] = i;
+                best_s[r] = score;
+                break;
+            }
+        }
+    }
+    size_t n = 0;
+    for (int r = 0; r < 3; r++) {
+        if (best[r] < 0 || best_s[r] < 3) continue;   /* a real overlap, not one shared word */
+        const mem_t *m = &s_mem[(s_mem_head + best[r]) % MEM_MAX];
+        int w = snprintf(out + n, cap - n, "问：%.120s 答：%.300s\n", m->q, m->a);
+        if (w < 0 || (size_t)w >= cap - n) break;
+        n += w;
+    }
+    if (n) ESP_LOGI(TAG, "recalled %d bytes for this question", (int)n);
+    return n;
 }

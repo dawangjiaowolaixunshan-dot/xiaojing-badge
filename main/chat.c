@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
@@ -11,14 +12,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "history.h"
+#include "net.h"
+#include "weather.h"
 #include "settings.h"
 
 static const char *TAG = "chat";
 #define URL "https://api.deepseek.com/chat/completions"
-#define MODEL "deepseek-chat"
+#define MODEL "deepseek-flash"   /* "deepseek-chat" was retired 2026-07-24 */
 #define HISTORY 10          /* exchanges kept as context, in full */
 #define REPLY_CAP 4096
 #define TURN_CAP 1024
+#define LINE_CAP 32768   /* one SSE line; the last one lists the search sources */
 
 /* Without a prompt of the user's own (tools/badge_setup.py prompt <file>). */
 static const char *DEFAULT_PROMPT = "你在一个挂在胸前的小圆屏吧唧里，屏幕很小，只能显示文字。";
@@ -26,7 +30,8 @@ static const char *DEFAULT_PROMPT = "你在一个挂在胸前的小圆屏吧唧�
 static const char *FORMAT_RULES =
     "\n\n输出要求：回答会被念出来，同时显示在小屏上。用简体中文口语；"
     "简单的问题一两句话说完，复杂的问题可以讲清楚，但最多300字。"
-    "不要用Markdown、标题、列表符号、表格和表情符号，不要换行分段。";
+    "不要用Markdown、标题、列表符号、表格和表情符号，不要换行分段。"
+    "如果上网搜索了，用自己的话简单概括，不要念网址、来源编号，也不要大段照搬原文。";
 
 typedef struct {
     char *q, *a;
@@ -34,7 +39,11 @@ typedef struct {
 
 static turn_t s_hist[HISTORY];
 static int s_nhist;
+
 static volatile bool s_busy;
+static bool s_filtered;   /* DeepSeek's review stopped the answer */
+static int s_searches;
+static chat_search_cb_t s_on_search;
 static char *s_question, *s_reply, *s_line;
 static chat_text_cb_t s_on_text;
 static chat_done_cb_t s_on_done;
@@ -64,6 +73,16 @@ static char *build_body(void)
     cJSON_AddStringToObject(root, "model", MODEL);
     cJSON_AddBoolToObject(root, "stream", true);
     cJSON_AddNumberToObject(root, "max_tokens", 800);
+    /* deepseek-flash thinks by default: slow to the first word, and a
+     * spoken answer gains nothing from it. */
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(root, "thinking"), "type", "disabled");
+    /* DeepSeek's own content review on top of the prompt: a child uses this. */
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(root, "safety_check"), "level", "high");
+    /* DeepSeek's own web search: the model searches when a question needs
+     * something newer than it knows (news, weather, scores). */
+    cJSON *tool = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool, "type", "deepseek_web_search");
+    cJSON_AddItemToArray(cJSON_AddArrayToObject(root, "tools"), tool);
     cJSON *msgs = cJSON_AddArrayToObject(root, "messages");
     char *custom = prompt_load();
     const char *base = custom ? custom : DEFAULT_PROMPT;
@@ -79,7 +98,38 @@ static char *build_body(void)
         add_msg(msgs, "user", s_hist[i].q);
         add_msg(msgs, "assistant", s_hist[i].a);
     }
-    add_msg(msgs, "user", s_question);
+    /* The model can't know the date; the badge's clock (from NTP) can. It
+     * goes on this question only, so the prompt and the past exchanges stay
+     * the same from one request to the next and hit DeepSeek's cache. */
+    if (net_time_valid()) {
+        static const char *WEEK[] = {"日", "一", "二", "三", "四", "五", "六"};
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        char wx[160];
+        weather_line(wx, sizeof(wx));   /* empty until the weather's in */
+        /* Older talk on the same thing, beyond the 10 exchanges sent anyway:
+         * so "the whale you told me about" still finds the whale. */
+        char *recall = heap_caps_malloc(1600, MALLOC_CAP_SPIRAM);
+        if (recall) history_recall(s_question, s_nhist, recall, 1600);
+        size_t qn = strlen(s_question) + 256 + (recall ? strlen(recall) + 64 : 0);
+        char *q = heap_caps_malloc(qn, MALLOC_CAP_SPIRAM);
+        if (q) {
+            int at = snprintf(q, qn, "%s\n（现在是北京时间 %d年%d月%d日 星期%s %02d:%02d%s%s）", s_question, tm.tm_year + 1900,
+                     tm.tm_mon + 1, tm.tm_mday, WEEK[tm.tm_wday], tm.tm_hour, tm.tm_min, wx[0] ? "；天气 " : "", wx);
+            if (recall && recall[0] && at > 0 && (size_t)at < qn) {
+                snprintf(q + at, qn - at, "\n（你们以前聊过的相关内容，需要时可参考：\n%s）", recall);
+            }
+            add_msg(msgs, "user", q);
+            free(q);
+            free(recall);
+        } else {
+            free(recall);
+            add_msg(msgs, "user", s_question);
+        }
+    } else {
+        add_msg(msgs, "user", s_question);
+    }
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return body;
@@ -91,6 +141,13 @@ static void handle_line(const char *line, size_t *len)
     if (strncmp(line, "data: ", 6) || !strcmp(line + 6, "[DONE]")) return;
     cJSON *root = cJSON_Parse(line + 6);
     cJSON *choice = cJSON_GetArrayItem(cJSON_GetObjectItem(root, "choices"), 0);
+    const char *ev = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(choice, "server_tool_event"), "type"));
+    if (ev && !strcmp(ev, "call_started")) {
+        s_searches++;
+        if (s_on_search) s_on_search();
+    }
+    const char *finish = cJSON_GetStringValue(cJSON_GetObjectItem(choice, "finish_reason"));
+    if (finish && !strcmp(finish, "content_filter")) s_filtered = true;
     const char *piece = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(choice, "delta"), "content"));
     if (piece && *piece) {
         size_t n = strlen(piece);
@@ -142,7 +199,7 @@ void chat_restore(void)
     if (!s_reply) {
         s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
         s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
-        s_line = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+        s_line = heap_caps_malloc(LINE_CAP, MALLOC_CAP_SPIRAM);
     }
     history_each(HISTORY_SHOW, restore_one, NULL);
     s_reply[0] = s_question[0] = '\0';
@@ -159,6 +216,8 @@ static void chat_task(void *arg)
     char *buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
     size_t reply_len = 0, line_len = 0;
     s_reply[0] = '\0';
+    s_filtered = false;
+    s_searches = 0;
     settings_get_key(KEY_DEEPSEEK, key, 256);
     snprintf(auth, 300, "Bearer %s", key);
     memset(key, 0, 256);
@@ -188,8 +247,12 @@ static void chat_task(void *arg)
         int n = esp_http_client_read(http, buf, 1023);
         buf[n > 0 ? n : 0] = '\0';
         ESP_LOGE(TAG, "HTTP %d: %.200s", status, buf);
-        snprintf(err_buf, sizeof(err_buf), status == 401 ? "DeepSeek 密钥不对 (401)" :
-                 status == 402 ? "DeepSeek 余额不足 (402)" : "DeepSeek 出错了 (%d)", status);
+        if (status == 400 && strstr(buf, "Content Exists Risk")) {
+            snprintf(err_buf, sizeof(err_buf), "这个问题不适合聊，换一个吧");
+        } else {
+            snprintf(err_buf, sizeof(err_buf), status == 401 ? "DeepSeek 密钥不对 (401)" :
+                     status == 402 ? "DeepSeek 余额不足 (402)" : "DeepSeek 出错了 (%d)", status);
+        }
         error = err_buf;
         goto done;
     }
@@ -207,13 +270,16 @@ static void chat_task(void *arg)
                 s_line[line_len] = '\0';
                 handle_line(s_line, &reply_len);
                 line_len = 0;
-            } else if (c != '\r' && line_len < 4095) {
+            } else if (c != '\r' && line_len < LINE_CAP - 1) {
                 s_line[line_len++] = c;
             }
         }
     }
-    ESP_LOGI(TAG, "reply %d bytes in %d ms", (int)reply_len, (int)(esp_log_timestamp() - t0));
-    if (!reply_len) {
+    ESP_LOGI(TAG, "reply %d bytes in %d ms, %d search%s", (int)reply_len, (int)(esp_log_timestamp() - t0), s_searches,
+             s_searches == 1 ? "" : "es");
+    if (s_filtered) {
+        error = "这个问题不适合聊，换一个吧";
+    } else if (!reply_len) {
         error = "DeepSeek 没有回答";
     } else {
         remember();
@@ -237,7 +303,7 @@ bool chat_ask(const char *question, chat_text_cb_t on_text, chat_done_cb_t on_do
     if (!s_reply) {
         s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
         s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
-        s_line = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+        s_line = heap_caps_malloc(LINE_CAP, MALLOC_CAP_SPIRAM);
     }
     strlcpy(s_question, question, TURN_CAP);
     s_on_text = on_text;
@@ -258,3 +324,5 @@ void chat_reset(void)
 }
 
 bool chat_busy(void) { return s_busy; }
+
+void chat_on_search(chat_search_cb_t cb) { s_on_search = cb; }

@@ -13,3 +13,7 @@ bool chat_ask(const char *question, chat_text_cb_t on_text, chat_done_cb_t on_do
 void chat_reset(void);     /* a new conversation, marked in the history */
 void chat_restore(void);   /* context since the last new conversation, at boot */
 bool chat_busy(void);
+
+/* Called (from the chat task) when DeepSeek starts a web search. */
+typedef void (*chat_search_cb_t)(void);
+void chat_on_search(chat_search_cb_t cb);

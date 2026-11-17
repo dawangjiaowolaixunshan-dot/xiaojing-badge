@@ -8,3 +8,5 @@
  */
 void pmu_init(void);
 void pmu_key_shutdown(bool on);
+bool pmu_read(int *pct, bool *charging, bool *usb);   /* pct -1 without a battery */
+void pmu_power_off(void);

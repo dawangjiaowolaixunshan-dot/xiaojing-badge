@@ -34,4 +34,8 @@ void ui_home(void);
 /* Screens. */
 void ui_poem_home(void);
 void ui_chat(void);
+void ui_settings(void);
+void ui_poem_read(void);
+bool ui_chat_listening(void);
+extern lv_font_t g_font_clock;   /* 60 px bold digits for the home clock */
 void ui_chat_inject(const char *question);   /* as if heard (testing over USB) */

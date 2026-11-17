@@ -21,7 +21,6 @@
 static const char *TAG = "tts";
 #define URI "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 #define MODEL "cosyvoice-v2"
-#define VOICE "longxiaochun_v2"
 #define AUDIO_BUF (MIC_RATE * 2 * 20)   /* 20 s of PCM ahead of the speaker */
 #define TEXT_CAP 8192
 #define BLOCK 320
@@ -41,7 +40,16 @@ static size_t s_text_len, s_msg_len;
 static char s_task_id[33];
 static bool s_enabled = true;
 static volatile bool s_flush;
-static volatile int s_level;   /* loudness of what's playing, 0..100 */
+
+/* Where each sentence starts in the task's audio, to tell which one is
+ * playing: a sentence's audio follows its result-generated event. */
+#define MAX_SENTENCES 48
+static volatile uint32_t s_rx_bytes, s_played;
+static volatile int32_t s_sent_at[MAX_SENTENCES];
+static volatile int s_nsent;
+static volatile int s_level;
+static const char *s_voice = "longhua_v2";   /* chat replies */
+static const char *s_task_voice;             /* the one the current task speaks with */   /* loudness of what's playing, 0..100 */
 
 /* ---- the speaker ---- */
 
@@ -53,6 +61,7 @@ static void player_task(void *arg)
     for (;;) {
         size_t n = xStreamBufferReceive(s_audio, mono, BLOCK * 2, portMAX_DELAY);
         if (s_flush) continue;
+        s_played += n;
         n /= 2;
         int64_t sq = 0;
         for (size_t i = 0; i < n; i++) {
@@ -74,6 +83,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (id == WEBSOCKET_EVENT_DATA && d->op_code == 0x2) {   /* audio */
         if (!(xEventGroupGetBits(s_ev) & EV_STOP) && d->data_len > 0) {
             xStreamBufferSend(s_audio, d->data_ptr, d->data_len, pdMS_TO_TICKS(2000));
+            s_rx_bytes += d->data_len;
         }
     } else if (id == WEBSOCKET_EVENT_DATA && d->op_code == 0x1) {
         if (d->payload_offset == 0) s_msg_len = 0;
@@ -86,6 +96,20 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         cJSON *root = cJSON_Parse(s_msg);
         cJSON *header = cJSON_GetObjectItem(root, "header");
         const char *event = cJSON_GetStringValue(cJSON_GetObjectItem(header, "event"));
+        if (event && !strcmp(event, "result-generated")) {
+            /* Count sentence-begin events rather than trust sentence.index,
+             * which didn't always go up with each piece sent: the n-th begin
+             * is the n-th sentence, and its audio follows. */
+            cJSON *out = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "payload"), "output");
+            const char *type = cJSON_GetStringValue(cJSON_GetObjectItem(out, "type"));
+            if (type && !strcmp(type, "sentence-begin") && s_nsent < MAX_SENTENCES) {
+                s_sent_at[s_nsent] = (int32_t)s_rx_bytes;
+                ESP_LOGD(TAG, "sentence %d (index %d) starts at %u bytes: %.40s", s_nsent,
+                         (int)cJSON_GetNumberValue(cJSON_GetObjectItem(cJSON_GetObjectItem(out, "sentence"), "index")),
+                         (unsigned)s_rx_bytes, cJSON_GetStringValue(cJSON_GetObjectItem(out, "original_text")) ?: "");
+                s_nsent++;
+            }
+        }
         if (event && !strcmp(event, "task-started")) xEventGroupSetBits(s_ev, EV_STARTED);
         else if (event && !strcmp(event, "task-finished")) xEventGroupSetBits(s_ev, EV_FINISHED);
         else if (event && !strcmp(event, "task-failed")) {
@@ -114,7 +138,7 @@ static void send_cmd(esp_websocket_client_handle_t ws, const char *action, const
         cJSON_AddStringToObject(payload, "model", MODEL);
         cJSON *p = cJSON_AddObjectToObject(payload, "parameters");
         cJSON_AddStringToObject(p, "text_type", "PlainText");
-        cJSON_AddStringToObject(p, "voice", VOICE);
+        cJSON_AddStringToObject(p, "voice", s_task_voice ? s_task_voice : s_voice);
         cJSON_AddStringToObject(p, "format", "pcm");
         cJSON_AddNumberToObject(p, "sample_rate", MIC_RATE);
         cJSON_AddNumberToObject(p, "volume", 60);
@@ -172,7 +196,14 @@ static void tts_task(void *arg)
         s_text_len = 0;
         xSemaphoreGive(s_mu);
         if (n) {
-            send_cmd(ws, "continue-task", piece);
+            /* \x1e marks where the caller wants a new sentence: each piece
+             * goes as its own continue-task, and the service numbers its
+             * result events by those (tts_sentence_now). */
+            for (char *seg = piece, *next; seg && *seg; seg = next) {
+                next = strchr(seg, '\x1e');
+                if (next) *next++ = '\0';
+                if (*seg) send_cmd(ws, "continue-task", seg);
+            }
             sent_any = true;
         } else if (b & EV_NO_MORE) {
             break;
@@ -211,13 +242,28 @@ void tts_init(void)
     xTaskCreatePinnedToCore(player_task, "player", 3072, NULL, 7, NULL, 1);
 }
 
+static bool begin_with(const char *voice);
+
 bool tts_begin(void)
 {
-    if (!s_enabled || !(xEventGroupGetBits(s_ev) & EV_IDLE)) {
-        ESP_LOGW(TAG, "not speaking: %s", s_enabled ? "busy" : "voice off");
+    if (!s_enabled) {
+        ESP_LOGW(TAG, "not speaking: voice off");
         return false;
     }
-    ESP_LOGI(TAG, "begin");
+    return begin_with(s_voice);
+}
+
+static bool begin_with(const char *voice)
+{
+    if (!(xEventGroupGetBits(s_ev) & EV_IDLE)) {
+        ESP_LOGW(TAG, "not speaking: busy");
+        return false;
+    }
+    ESP_LOGI(TAG, "begin (%s)", voice);
+    s_rx_bytes = s_played = 0;
+    s_nsent = 0;
+    for (int i = 0; i < MAX_SENTENCES; i++) s_sent_at[i] = -1;
+    s_task_voice = voice;
     xEventGroupClearBits(s_ev, 0xff);
     s_text_len = 0;
     s_flush = false;
@@ -256,6 +302,7 @@ int tts_level(void) { return tts_active() ? s_level : 0; }
 
 bool tts_active(void)
 {
+    if (!s_ev) return false;   /* asked before tts_init() (the screen-off timer starts first) */
     return !s_flush && (!(xEventGroupGetBits(s_ev) & EV_IDLE) || xStreamBufferBytesAvailable(s_audio) > 0);
 }
 
@@ -265,4 +312,65 @@ void tts_set_enabled(bool on)
     uint8_t v = on;
     settings_set_blob("voice", &v, 1);
     if (!on) tts_stop();
+}
+
+void tts_set_voice(const char *voice) { s_voice = voice; }
+
+/* tts_say(): whatever is playing stops, then this plays once the last task
+ * has wound down (closing its socket takes a moment), off the UI task. */
+typedef struct {
+    char *text;
+    const char *voice;
+} say_t;
+
+static void say_task(void *arg)
+{
+    say_t *say = arg;
+    xEventGroupWaitBits(s_ev, EV_IDLE, pdFALSE, pdTRUE, pdMS_TO_TICKS(4000));
+    if (begin_with(say->voice)) {
+        tts_feed(say->text);
+        tts_finish();
+    }
+    free(say->text);
+    free(say);
+    vTaskDelete(NULL);
+}
+
+void tts_say_with(const char *voice, const char *text)
+{
+    if (!s_ev) return;
+    tts_stop();
+    say_t *say = heap_caps_malloc(sizeof(say_t), MALLOC_CAP_SPIRAM);
+    size_t n = strlen(text);
+    char *copy = heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (!say || !copy) {
+        free(say);
+        free(copy);
+        return;
+    }
+    memcpy(copy, text, n + 1);
+    say->text = copy;
+    say->voice = voice;
+    if (xTaskCreate(say_task, "say", 3072, say, 4, NULL) != pdPASS) {
+        free(copy);
+        free(say);
+    }
+}
+
+void tts_say(const char *text) { tts_say_with(s_voice, text); }
+
+void tts_set_volume(int pct)
+{
+    esp_codec_dev_handle_t spk = mic_speaker();
+    if (spk) esp_codec_dev_set_out_vol(spk, pct);
+}
+
+int tts_sentence_now(void)
+{
+    if (!tts_active()) return -1;
+    int now = -1;
+    for (int i = 0; i < s_nsent; i++) {
+        if (s_sent_at[i] >= 0 && (uint32_t)s_sent_at[i] <= s_played) now = i;
+    }
+    return now;
 }

@@ -6,9 +6,13 @@
 
 static const char *TAG = "pmu";
 #define AXP2101_ADDR 0x34
+#define REG_STATUS1 0x00      /* bit5 VBUS good, bit3 battery present */
+#define REG_STATUS2 0x01      /* bits 6:5 = 01 while charging */
 #define REG_COMMON_CFG 0x10   /* bit2: shut down after 16 s of PWR; bits 1:0 are commands, never write 1 */
 #define REG_PWROFF_EN 0x22    /* bit1: power off when PWR is held past the hold-off */
 #define REG_IRQ_LEVEL 0x27    /* bits 3:2: hold-off; 11 = 10 s */
+#define REG_ADC_ENABLE 0x30   /* bit0 battery voltage */
+#define REG_BAT_PERCENT 0xA4
 #define REG_INTEN1 0x40
 #define REG_INTSTS1 0x48
 
@@ -45,6 +49,7 @@ void pmu_init(void)
         wr(REG_INTEN1 + i, 0);
         wr(REG_INTSTS1 + i, 0xff);
     }
+    if (rd(REG_ADC_ENABLE, &v) == ESP_OK) wr(REG_ADC_ENABLE, v | 0x01);   /* the fuel gauge needs it */
     ESP_LOGI(TAG, "PWR hold-off 10 s");
 }
 
@@ -61,4 +66,23 @@ void pmu_key_shutdown(bool on)
             s_16s_was_on = wr(REG_COMMON_CFG, v | 0x04) != ESP_OK;
         }
     }
+}
+
+bool pmu_read(int *pct, bool *charging, bool *usb)
+{
+    uint8_t s1, s2, p;
+    *pct = -1;
+    *charging = *usb = false;
+    if (!s_dev || rd(REG_STATUS1, &s1) != ESP_OK || rd(REG_STATUS2, &s2) != ESP_OK) return false;
+    bool battery = s1 & 0x08;
+    *usb = s1 & 0x20;
+    *charging = battery && ((s2 >> 5) & 0x3) == 0x1;
+    if (battery && rd(REG_BAT_PERCENT, &p) == ESP_OK && p <= 100) *pct = p;
+    return true;
+}
+
+void pmu_power_off(void)
+{
+    uint8_t v;
+    if (s_dev && rd(REG_COMMON_CFG, &v) == ESP_OK) wr(REG_COMMON_CFG, (v & ~0x03) | 0x01);
 }

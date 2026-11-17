@@ -13,6 +13,7 @@
 #include "esp_random.h"
 #include "history.h"
 #include "mic.h"
+#include "pet.h"
 #include "net.h"
 #include "settings.h"
 #include "tts.h"
@@ -20,33 +21,21 @@
 
 static const char *TAG = "ui_chat";
 
-static lv_obj_t *s_scr, *s_status, *s_box, *s_q, *s_a, *s_intro, *s_talk, *s_talk_lbl;
+static lv_obj_t *s_footer;   /* "new conversation", kept last in the box */
+static lv_obj_t *s_scr, *s_status, *s_box, *s_q, *s_a, *s_intro;
 static bool s_listening;
 static bool s_speaking;      /* this reply goes to the speaker too */
 static size_t s_spoken;      /* how much of it has been handed over */
 static lv_obj_t *s_voice_lbl, *s_whale;
-LV_IMAGE_DECLARE(whale_img);
 typedef enum { W_IDLE, W_LISTEN, W_THINK, W_SPEAK } whale_mode_t;
 static whale_mode_t s_mode;
 
-/* One-off moves on top of the mode's motion. */
-typedef enum { ACT_NONE, ACT_HOP, ACT_TILT, ACT_TWIST, ACT_JOY } whale_act_t;
-static whale_act_t s_act;
-static uint32_t s_act_t0, s_next_idle_act;
-
-/* Bubbles drifting up around her: a whale's breath. */
-#define BUBBLES 6
-static struct {
-    lv_obj_t *o;
-    float x, y, vy, life;
-} s_bub[BUBBLES];
-static uint32_t s_last_bubble;
-static int last_dx, last_dy, last_rot, last_sx, last_sy;   /* what the whale's styles are set to */
-static void start_act(whale_act_t a);
-#define WHALE_PX 136
+/* A one-off clip (a tap, cheering, sighing) plays out before the mode's own. */
+static bool s_oneshot;
+static void play_once(pet_clip_t c);
 static char s_qbuf[1100];
 static char *s_wrap;   /* wrapped copy for a label, PSRAM */
-#define BOX_W 300
+#define BOX_W 340
 #define WRAP_CAP 6144
 
 /*
@@ -54,12 +43,12 @@ static char *s_wrap;   /* wrapped copy for a label, PSRAM */
  * instead: break before a character that would pass the width, unless it's
  * punctuation that mustn't start a line, which hangs into the margin.
  */
-static const char *wrap(const char *src)
+static const char *wrap_to(const char *src, int width)
 {
     static const char *NO_START = "，。、；：？！）》」』”’…—,.;:?!)%";
     if (!s_wrap) s_wrap = heap_caps_malloc(WRAP_CAP, MALLOC_CAP_SPIRAM);
     if (!s_wrap) return src;
-    const int limit = BOX_W - 26;   /* the margin a hanging mark goes in */
+    const int limit = width - 24;   /* the margin a hanging mark goes in */
     int x = 0;
     size_t o = 0;
     for (const char *p = src; *p && o + 8 < WRAP_CAP;) {
@@ -95,27 +84,68 @@ static const char *wrap(const char *src)
     return s_wrap;
 }
 
+#define BUBBLE_W (BOX_W + 20)   /* an answer's text: the box's width (wrap_to keeps 24 px for hanging marks) */
+#define MINE_W 280             /* a question's, to the right */
+static const char *wrap(const char *src) { return wrap_to(src, BUBBLE_W); }
+
+/* What's happening, in a line under her: shown only while something is. */
 static void set_status(const char *text, uint32_t color)
 {
     if (!s_status) return;
+    bool idle = !strcmp(text, "按住说话");
+    lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, idle);
+    if (idle) return;
     lv_label_set_text(s_status, text);
     lv_obj_set_style_text_color(s_status, lv_color_hex(color), 0);
 }
 
+static void keep_footer_last(void)
+{
+    if (s_footer) lv_obj_move_to_index(s_footer, -1);
+}
+
+/* To the newest message. (Scrolling to LV_COORD_MAX didn't move at all: new
+ * messages arrived below the view and the screen seemed stuck.) */
 static void scroll_down(void)
 {
+    if (!s_box) return;
     lv_obj_update_layout(s_box);
-    lv_obj_scroll_to_y(s_box, LV_COORD_MAX, LV_ANIM_OFF);
+    int32_t below = lv_obj_get_scroll_bottom(s_box);
+    if (below > 0) lv_obj_scroll_by(s_box, 0, -below, LV_ANIM_OFF);
 }
 
 /* ---- the conversation in the box (lock held) ---- */
 
+/* A line across the box: a note in the middle (a divider, a hint). */
 static lv_obj_t *add_text(const char *text, uint32_t color, bool centre)
 {
-    lv_obj_t *l = ui_label(s_box, &g_font_text, color, centre ? text : wrap(text));
+    lv_obj_t *l = ui_label(s_box, &g_font_text, color, centre ? text : wrap_to(text, BOX_W));
     lv_obj_set_width(l, BOX_W);
     lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
     if (centre) lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    keep_footer_last();
+    return l;
+}
+
+/* A message, no bubble round it: a bubble's fill and padding took a fifth
+ * of the circle's widest band. 小鲸's answers use the full width in white;
+ * the child's questions are blue and to the right. Returns the label; its
+ * parent is the full-width row. */
+static lv_obj_t *add_bubble(const char *text, bool mine)
+{
+    lv_obj_t *row = lv_obj_create(s_box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, BOX_W, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, mine ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *b = lv_obj_create(row);   /* kept as a wrapper so callers can find the row */
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = ui_label(b, &g_font_text, mine ? 0x7fb2ff : 0xf2f2f2, mine ? wrap_to(text, MINE_W) : wrap(text));
+    if (mine) lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
+    keep_footer_last();
     return l;
 }
 
@@ -125,10 +155,9 @@ static void add_pair(const char *q, const char *a)
         lv_obj_delete(s_intro);
         s_intro = NULL;
     }
-    snprintf(s_qbuf, sizeof(s_qbuf), "你：%s", q);
-    s_q = add_text(s_qbuf, C_ACCENT, false);
-    lv_obj_set_style_margin_top(s_q, 10, 0);
-    s_a = add_text(a, C_TEXT, false);
+    s_q = add_bubble(q[0] ? q : "…", true);
+    lv_obj_set_style_margin_top(lv_obj_get_parent(lv_obj_get_parent(s_q)), 6, 0);
+    s_a = add_bubble(a[0] ? a : "…", false);
 }
 
 static void add_divider(void)
@@ -139,18 +168,30 @@ static void add_divider(void)
 /* A press that heard nothing leaves no empty pair behind. */
 static void drop_pair(void)
 {
-    if (s_q) lv_obj_delete(s_q);
-    if (s_a) lv_obj_delete(s_a);
+    if (s_q) lv_obj_delete(lv_obj_get_parent(lv_obj_get_parent(s_q)));   /* the bubble's row */
+    if (s_a) lv_obj_delete(lv_obj_get_parent(lv_obj_get_parent(s_a)));
     s_q = s_a = NULL;
 }
 
 static void add_saved(const char *q, const char *a, void *ctx)
 {
+    int *n = ctx;
+    if (n && (*n)++ == 0) add_text(LV_SYMBOL_UP "  往上翻是以前的对话", C_DIM, true);
     if (q) add_pair(q, a);
     else add_divider();
 }
 
 /* ---- callbacks from the network tasks: take the lock, and the screen may be gone ---- */
+
+static void on_search(void)
+{
+    ui_lock();
+    if (s_scr) {
+        set_status("正在搜索…", C_BLUE);
+        s_mode = W_THINK;
+    }
+    ui_unlock();
+}
 
 static void on_reply(const char *reply)
 {
@@ -160,6 +201,7 @@ static void on_reply(const char *reply)
         s_spoken = n;
     }
     ui_lock();
+    if (s_mode != W_SPEAK) set_status("正在回答…", C_BLUE);
     s_mode = W_SPEAK;
     if (s_a) {
         lv_label_set_text(s_a, wrap(reply));
@@ -191,7 +233,7 @@ static void on_reply_done(const char *error)
     }
     ui_lock();
     if (error || !s_speaking_tail()) s_mode = W_IDLE;
-    if (!error) start_act(ACT_JOY);
+    play_once(error ? PET_SIGH : PET_CHEER);
     if (error && !strcmp(error, "连不上 DeepSeek")) net_error_status("DeepSeek");
     else if (error) set_status(error, C_RED);
     else set_status("按住说话", C_DIM);
@@ -206,8 +248,8 @@ static void on_asr(const char *text, bool final)
         return;
     }
     if (!final) {
-        snprintf(s_qbuf, sizeof(s_qbuf), "你：%s", text);
-        if (s_q) lv_label_set_text(s_q, wrap(s_qbuf));
+        snprintf(s_qbuf, sizeof(s_qbuf), "%s", text[0] ? text : "…");
+        if (s_q) lv_label_set_text(s_q, wrap_to(s_qbuf, MINE_W));
         scroll_down();
     } else if (!text) {
         s_mode = W_IDLE;
@@ -218,8 +260,8 @@ static void on_asr(const char *text, bool final)
         drop_pair();
         set_status("没听清，再说一次", C_DIM);
     } else {
-        snprintf(s_qbuf, sizeof(s_qbuf), "你：%s", text);
-        if (s_q) lv_label_set_text(s_q, wrap(s_qbuf));
+        snprintf(s_qbuf, sizeof(s_qbuf), "%s", text);
+        if (s_q) lv_label_set_text(s_q, wrap_to(s_qbuf, MINE_W));
         s_spoken = 0;
         s_speaking = tts_begin();   /* connects while DeepSeek starts writing */
         if (chat_ask(text, on_reply, on_reply_done)) {
@@ -267,38 +309,21 @@ static void talk(bool down)
         s_mode = W_LISTEN;
         add_pair("", "");
         scroll_down();
-        set_status("正在听…", C_GREEN);
-        lv_obj_set_style_bg_color(s_talk, lv_color_hex(C_GREEN), 0);
-        lv_label_set_text(s_talk_lbl, "松开发送");
+        set_status("正在听… 松开发送", C_GREEN);
     } else if (s_listening) {
         s_listening = false;
         s_mode = W_THINK;
         asr_end();
         set_status("识别中…", C_DIM);
-        lv_obj_set_style_bg_color(s_talk, lv_color_hex(C_BLUE), 0);
-        lv_label_set_text(s_talk_lbl, "按住说话");
     }
 }
 
-static void on_talk(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    talk(code == LV_EVENT_PRESSED);
-}
 
-static void on_new(lv_event_t *e)
-{
-    if (chat_busy() || s_listening) return;
-    chat_reset();
-    add_divider();
-    s_q = s_a = NULL;
-    scroll_down();
-}
 
-static void on_voice(lv_event_t *e)
+
+static void on_gesture(lv_event_t *e)
 {
-    tts_set_enabled(!tts_enabled());
-    lv_label_set_text(s_voice_lbl, tts_enabled() ? LV_SYMBOL_VOLUME_MAX : LV_SYMBOL_MUTE);
+    if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_RIGHT) ui_home();   /* a swipe right goes back */
 }
 
 static void on_delete(lv_event_t *e)
@@ -306,214 +331,81 @@ static void on_delete(lv_event_t *e)
     tts_stop();
     if (s_listening) asr_cancel();
     s_listening = false;
-    s_scr = s_status = s_box = s_q = s_a = s_intro = s_talk = s_talk_lbl = s_voice_lbl = s_whale = NULL;
-    for (int i = 0; i < BUBBLES; i++) {
-        s_bub[i].o = NULL;
-        s_bub[i].life = 0;
-    }
+    s_footer = NULL;
+    s_scr = s_status = s_box = s_q = s_a = s_intro = s_voice_lbl = s_whale = NULL;
 }
 
-static float frand(void) { return (esp_random() & 0xffff) / 65535.0f; }
-
-static void start_act(whale_act_t a)
+static void play_once(pet_clip_t c)
 {
-    s_act = a;
-    s_act_t0 = lv_tick_get();
-}
-
-static void spawn_bubble(float x, float y)
-{
-    for (int i = 0; i < BUBBLES; i++) {
-        if (s_bub[i].life > 0 || !s_bub[i].o) continue;
-        int d = 6 + (int)(frand() * 10);
-        lv_obj_set_size(s_bub[i].o, d, d);
-        s_bub[i].x = x;
-        s_bub[i].y = y;
-        s_bub[i].vy = 1.2f + frand() * 1.3f;
-        s_bub[i].life = 1.0f;
-        lv_obj_remove_flag(s_bub[i].o, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-}
-
-static void move_bubbles(void)
-{
-    for (int i = 0; i < BUBBLES; i++) {
-        if (!s_bub[i].o || s_bub[i].life <= 0) continue;
-        s_bub[i].y -= s_bub[i].vy;
-        s_bub[i].x += sinf(s_bub[i].y / 9.0f) * 0.6f;
-        s_bub[i].life -= 0.022f;
-        if (s_bub[i].life <= 0 || s_bub[i].y < -228) {
-            s_bub[i].life = 0;
-            lv_obj_add_flag(s_bub[i].o, LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-        lv_obj_align(s_bub[i].o, LV_ALIGN_CENTER, (int)s_bub[i].x, (int)s_bub[i].y);
-        if (s_bub[i].life < 0.4f) lv_obj_set_style_opa(s_bub[i].o, (lv_opa_t)(255 * s_bub[i].life / 0.4f) & 0xe0, 0);
-        else lv_obj_set_style_opa(s_bub[i].o, LV_OPA_COVER, 0);
-    }
+    if (!s_whale) return;
+    pet_play(s_whale, c, false);
+    s_oneshot = true;
 }
 
 static void on_whale_tap(lv_event_t *e)
 {
-    start_act(ACT_HOP);
-    for (int i = 0; i < 4; i++) spawn_bubble(-40 + frand() * 80, -170 + frand() * 30);
+    static const pet_clip_t TAP[] = {PET_WAVE, PET_JOY, PET_SHY, PET_GIGGLE};
+    play_once(TAP[esp_random() % 4]);
 }
 
 static void anim_timer(lv_timer_t *t)
 {
-    if (s_talk) lv_obj_set_style_outline_width(s_talk, s_listening ? 2 + mic_level() / 8 : 0, 0);
     if (!s_whale) return;
     if (s_mode == W_SPEAK && !chat_busy() && !tts_active()) s_mode = W_IDLE;
-    uint32_t now = lv_tick_get();
-    float ts = now / 1000.0f, pi2 = 6.2831853f;
-    float dx = 0, dy = 0, rot = 0, sx = 1, sy = 1;
-
-    switch (s_mode) {
-    case W_IDLE:   /* floating; moving costs little, scaling/rotating costs a lot */
-        dy = 3 * sinf(pi2 * ts / 3.0f);
-        if (!s_next_idle_act) s_next_idle_act = now + 4000;
-        if (s_act == ACT_NONE && now > s_next_idle_act) {
-            static const whale_act_t IDLE_ACTS[] = {ACT_HOP, ACT_TILT, ACT_TWIST, ACT_TILT};
-            start_act(IDLE_ACTS[esp_random() % 4]);
-            s_next_idle_act = now + 5000 + (uint32_t)(frand() * 6000);
-        }
-        if (now - s_last_bubble > 2500 && frand() < 0.02f) {
-            spawn_bubble(30 + frand() * 30, -200);
-            s_last_bubble = now;
-        }
-        break;
-    case W_LISTEN: {   /* leans in, wobbling with the voice */
-        float v = mic_level() / 100.0f;
-        sx = sy = 1.04f + 0.18f * v;
-        rot = 25 * sinf(pi2 * ts / 0.7f) * v + 20;
-        dy = -3;
-        break;
-    }
-    case W_THINK:   /* sways and blows bubbles */
-        rot = 50 * sinf(pi2 * ts / 1.4f);
-        dx = 4 * sinf(pi2 * ts / 1.4f);
-        if (now - s_last_bubble > 450) {
-            spawn_bubble(28 + frand() * 24, -215);
-            s_last_bubble = now;
-        }
-        break;
-    case W_SPEAK: {   /* bounces with the loudness of what she's saying */
-        static float lvl;
-        lvl = lvl * 0.6f + 0.4f * (tts_active() ? tts_level() / 100.0f : 0.5f + 0.5f * fabsf(sinf(pi2 * ts / 0.5f)));
-        dy = -9 * lvl;   /* only a move: the text streaming in needs the time */
-        break;
-    }
-    }
-    if (s_mode != W_IDLE) s_next_idle_act = now + 3000;
-
-    /* One-off moves, each about a second. */
-    float p = (now - s_act_t0) / 1000.0f;
-    switch (s_act) {
-    case ACT_NONE: break;
-    case ACT_HOP:
-        if (p < 0.12f) dy += 4 * p / 0.12f;                                    /* crouch */
-        else if (p < 0.62f) dy -= 26 * sinf(3.14159f * (p - 0.12f) / 0.5f) - 4 * (1 - (p - 0.12f) / 0.5f);
-        else if (p < 0.75f) dy += 3 * sinf(3.14159f * (p - 0.62f) / 0.13f);    /* land */
-        else s_act = ACT_NONE;
-        break;
-    case ACT_TILT:   /* a curious head tilt, held a moment */
-        if (p < 1.4f) rot += 120 * sinf(3.14159f * fminf(p / 1.4f, 1)) * (s_act_t0 & 1 ? 1 : -1);
-        else s_act = ACT_NONE;
-        break;
-    case ACT_TWIST:   /* a little shimmy */
-        if (p < 0.8f) { rot += 90 * sinf(pi2 * p * 3) * (1 - p / 0.8f); dx += 3 * sinf(pi2 * p * 3); }
-        else s_act = ACT_NONE;
-        break;
-    case ACT_JOY:   /* answered: two quick hops and a burst of bubbles */
-        if (p < 0.05f && now - s_last_bubble > 200) {
-            for (int i = 0; i < 5; i++) spawn_bubble(-50 + frand() * 100, -150 - frand() * 30);
-            s_last_bubble = now;
-        }
-        if (p < 0.9f) dy -= 14 * fabsf(sinf(3.14159f * p / 0.45f));
-        else s_act = ACT_NONE;
-        break;
-    }
-
-    /* Touch the styles only when something visible changed: each change is
-     * a redraw, and a rotated or scaled one is a slow one. */
-    int idx = (int)lroundf(dx), idy = (int)lroundf(dy);
-    int irot = (int)lroundf(rot / 10) * 10;            /* whole degrees */
-    int isx = (int)lroundf(sx * 32) * 8, isy = (int)lroundf(sy * 32) * 8;   /* 1/32 steps */
-    if (idx != last_dx) lv_obj_set_style_translate_x(s_whale, last_dx = idx, 0);
-    if (idy != last_dy) lv_obj_set_style_translate_y(s_whale, last_dy = idy, 0);
-    if (irot != last_rot) lv_obj_set_style_transform_rotation(s_whale, last_rot = irot, 0);
-    if (isx != last_sx) lv_obj_set_style_transform_scale_x(s_whale, last_sx = isx, 0);
-    if (isy != last_sy) lv_obj_set_style_transform_scale_y(s_whale, last_sy = isy, 0);
-    move_bubbles();
+    /* Listening, thinking and talking cut a one-off short; idling waits for it. */
+    if (s_oneshot && !pet_finished(s_whale) && s_mode == W_IDLE) return;
+    s_oneshot = false;
+    static const pet_clip_t FOR_MODE[] = {[W_IDLE] = PET_IDLE, [W_LISTEN] = PET_LISTEN,
+                                          [W_THINK] = PET_THINK, [W_SPEAK] = PET_TALK};
+    pet_clip_t want = FOR_MODE[s_mode];
+    if (pet_clip(s_whale) != want || pet_finished(s_whale)) pet_play(s_whale, want, true);
 }
 
 void ui_chat(void)
 {
     lv_obj_t *scr = ui_screen();
-    ui_back_button(scr);
-    s_whale = lv_image_create(scr);
-    lv_image_set_src(s_whale, &whale_img);
-    lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -160);
-    lv_obj_set_style_transform_pivot_x(s_whale, WHALE_PX / 2, 0);
-    lv_obj_set_style_transform_pivot_y(s_whale, WHALE_PX, 0);   /* sways from her feet */
-    s_mode = W_IDLE;
-    s_act = ACT_NONE;
-    s_next_idle_act = 0;
-    last_dx = last_dy = last_rot = 0;   /* a new image starts untransformed */
-    last_sx = last_sy = 256;
+    /* The round screen's middle is its widest part: the conversation gets it
+     * (340 x 300). She sits small in the top cap, the talk button in the
+     * bottom one; back is BOOT or a swipe right, a new conversation is the
+     * last thing in the list. */
+    s_whale = pet_create(scr);
+    lv_image_set_scale(s_whale, 128);   /* 156 px at 50% */
+    lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -190);
     lv_obj_add_flag(s_whale, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_whale, on_whale_tap, LV_EVENT_CLICKED, NULL);
-    for (int i = 0; i < BUBBLES; i++) {
-        lv_obj_t *b = lv_obj_create(scr);
-        lv_obj_remove_style_all(b);
-        lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_border_width(b, 2, 0);
-        lv_obj_set_style_border_color(b, lv_color_hex(0xa8e6ff), 0);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x5cc8ff), 0);
-        lv_obj_set_style_bg_opa(b, LV_OPA_20, 0);
-        lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
-        s_bub[i].o = b;
-        s_bub[i].life = 0;
-    }
-    s_status = ui_label(scr, &g_font_text, C_DIM, "按住说话");
-    lv_obj_align(s_status, LV_ALIGN_CENTER, 0, -76);
+    s_mode = W_IDLE;
+    s_oneshot = false;
+    pet_play(s_whale, PET_IDLE, true);
+    s_status = ui_label(scr, &g_font_text, C_DIM, "");
+    lv_obj_align(s_status, LV_ALIGN_CENTER, 0, -134);
+    lv_obj_add_flag(s_status, LV_OBJ_FLAG_HIDDEN);
 
     s_box = lv_obj_create(scr);
     lv_obj_remove_style_all(s_box);
-    lv_obj_set_size(s_box, BOX_W, 186);
-    lv_obj_align(s_box, LV_ALIGN_CENTER, 0, 36);
+    /* No buttons: PWR talks, new conversations start by themselves, BOOT or
+     * a swipe right goes back. The list runs to the bottom of the circle,
+     * padded so the newest message sits above where it narrows. */
+    lv_obj_set_size(s_box, BOX_W, 350);
+    lv_obj_align(s_box, LV_ALIGN_CENTER, 0, 42);
     lv_obj_set_flex_flow(s_box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_box, 8, 0);
+    lv_obj_set_flex_align(s_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_box, 10, 0);
+    lv_obj_set_style_pad_top(s_box, 22, 0);   /* clear of the status line */
+    lv_obj_set_style_pad_bottom(s_box, 56, 0);
     lv_obj_set_scroll_dir(s_box, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_box, LV_SCROLLBAR_MODE_OFF);
-    s_intro = add_text("按住下面的按钮或侧面的 PWR 键说话，松开就发给 DeepSeek。往上滑能看以前的问答。",
-                       C_DIM, false);
-    history_each(HISTORY_SHOW, add_saved, NULL);
+    s_footer = NULL;
+    s_intro = add_text("按住侧面的 PWR 键说话，松开就发给小鲸。", C_DIM, true);
+    int saved = 0;
+    history_each(HISTORY_SHOW, add_saved, &saved);
     s_q = s_a = NULL;
-
-    s_talk = ui_button(scr, NULL, &g_font_text, 190, 58, C_BLUE, NULL, NULL);
-    lv_obj_align(s_talk, LV_ALIGN_CENTER, 0, 168);
-    lv_obj_set_style_outline_color(s_talk, lv_color_hex(C_GREEN), 0);
-    lv_obj_set_style_outline_opa(s_talk, LV_OPA_50, 0);
-    s_talk_lbl = ui_label(s_talk, &g_font_text, 0xffffff, "按住说话");
-    lv_obj_center(s_talk_lbl);
-    lv_obj_add_event_cb(s_talk, on_talk, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_talk, on_talk, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(s_talk, on_talk, LV_EVENT_PRESS_LOST, NULL);
-
-    lv_obj_t *n = ui_button(scr, LV_SYMBOL_REFRESH, &g_font_text, 52, 52, C_PANEL, on_new, NULL);
-    lv_obj_align(n, LV_ALIGN_CENTER, 186, -96);
-
-    lv_obj_t *v = ui_button(scr, NULL, &g_font_text, 52, 52, C_PANEL, on_voice, NULL);
-    lv_obj_align(v, LV_ALIGN_CENTER, 186, 44);
-    s_voice_lbl = ui_label(v, &g_font_text, 0xffffff, tts_enabled() ? LV_SYMBOL_VOLUME_MAX : LV_SYMBOL_MUTE);
-    lv_obj_center(s_voice_lbl);
+    s_voice_lbl = NULL;   /* reading aloud is switched in 设置 */
+    lv_obj_add_event_cb(scr, on_gesture, LV_EVENT_GESTURE, NULL);
 
     lv_obj_add_event_cb(scr, on_delete, LV_EVENT_DELETE, NULL);
+    chat_on_search(on_search);
     static lv_timer_t *anim;   /* one for good; idle while the chat screen is gone */
-    if (!anim) anim = lv_timer_create(anim_timer, 50, NULL);
+    if (!anim) anim = lv_timer_create(anim_timer, 100, NULL);
     s_scr = scr;
     ui_show(scr, ui_home, talk);
     scroll_down();
@@ -534,3 +426,5 @@ void ui_chat_inject(const char *question)
         chat_ask(question, on_reply, on_reply_done);
     }
 }
+
+bool ui_chat_listening(void) { return s_listening; }
