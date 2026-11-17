@@ -97,12 +97,13 @@ static void trim(void)
     }
 }
 
-void history_add(const char *q, const char *a)
+void history_add(const char *q, const char *a, const char *who)
 {
     if (!s_ok) return;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "q", q);
     cJSON_AddStringToObject(o, "a", a);
+    if (who && *who) cJSON_AddStringToObject(o, "s", who);   /* child / dad / mom */
     time_t now = time(NULL);
     if (now > 1767225600) cJSON_AddNumberToObject(o, "t", (double)now);   /* once the clock is set */
     char *line = cJSON_PrintUnformatted(o);

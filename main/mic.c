@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "bsp/esp-bsp.h"
 #include "esp_codec_dev.h"
@@ -20,6 +21,50 @@ static esp_codec_dev_handle_t s_mic, s_spk;
 static volatile mic_sink_t s_sink;
 static volatile int s_level;
 static TaskHandle_t s_task;
+
+/* Pitch while someone talks: one estimate per 20 ms block (over the last
+ * 40 ms), kept while voiced; the median at the end tells voices apart. */
+#define PITCH_MAX 600
+static volatile bool s_pitch_on;
+static uint16_t *s_pitches;
+static volatile int s_npitch;
+static int16_t s_prev[BLOCK];
+
+static void pitch_block(const int16_t *cur)
+{
+    /* Down to 8 kHz first (pairs averaged): pitch needs no more, and the
+     * autocorrelation costs a quarter. */
+    enum { N = BLOCK, RATE = MIC_RATE / 2, LMIN = RATE / 450, LMAX = RATE / 70 };
+    static float x[N];
+    float e = 0;
+    for (int j = 0; j < N; j++) {
+        int i = 2 * j;
+        float v = i < BLOCK ? 0.5f * (s_prev[i] + s_prev[i + 1]) : 0.5f * (cur[i - BLOCK] + cur[i - BLOCK + 1]);
+        x[j] = v;
+        e += v * v;
+    }
+    if (e < N * 200.0f * 200.0f) return;   /* too quiet to be speech */
+    static float r[LMAX + 1];
+    float best = 0;
+    int lag = 0;
+    for (int l = LMIN; l <= LMAX; l++) {
+        float xy = 0, xx = 0, yy = 0;
+        for (int i = 0; i + l < N; i++) {
+            xy += x[i] * x[i + l];
+            xx += x[i] * x[i];
+            yy += x[i + l] * x[i + l];
+        }
+        r[l] = xx > 0 && yy > 0 ? xy / sqrtf(xx * yy) : 0;
+        if (r[l] > best) {
+            best = r[l];
+            lag = l;
+        }
+    }
+    if (best < 0.6f || !lag) return;   /* not voiced */
+    /* A peak at twice the period looks as good; prefer the shorter one. */
+    if (lag / 2 >= LMIN && r[lag / 2] > 0.85f * best) lag /= 2;
+    if (s_npitch < PITCH_MAX) s_pitches[s_npitch++] = (uint16_t)(RATE / lag);
+}
 
 static void mic_task(void *arg)
 {
@@ -43,6 +88,8 @@ static void mic_task(void *arg)
         float rms = sqrtf((float)sq / BLOCK);
         int lvl = rms < 30 ? 0 : (int)(20.0f * log10f(rms / 30.0f) * 2.5f);
         s_level = lvl > 100 ? 100 : lvl;
+        if (s_pitch_on && s_pitches) pitch_block(mono);
+        memcpy(s_prev, mono, sizeof(s_prev));
         mic_sink_t sink = s_sink;
         if (sink) sink(mono, BLOCK);
     }
@@ -103,3 +150,22 @@ void mic_stop(void)
 int mic_level(void) { return s_level; }
 
 esp_codec_dev_handle_t mic_speaker(void) { return s_spk; }
+
+void mic_pitch_begin(void)
+{
+    if (!s_pitches) s_pitches = heap_caps_malloc(PITCH_MAX * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    s_npitch = 0;
+    s_pitch_on = true;
+}
+
+static int cmp_u16(const void *a, const void *b) { return *(const uint16_t *)a - *(const uint16_t *)b; }
+
+int mic_pitch_end(void)
+{
+    s_pitch_on = false;
+    int n = s_npitch;
+    if (!s_pitches || n < 10) return 0;   /* under 0.2 s of voice: can't tell */
+    qsort(s_pitches, n, sizeof(uint16_t), cmp_u16);
+    ESP_LOGI(TAG, "pitch: median %d Hz over %d voiced blocks", s_pitches[n / 2], n);
+    return s_pitches[n / 2];
+}

@@ -14,6 +14,7 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "mic.h"
+#include "net.h"
 #include "settings.h"
 
 static const char *TAG = "asr";
@@ -181,6 +182,7 @@ done:
     free(headers);
     free(key);
     free(chunk);
+    net_awake(false);
     xEventGroupSetBits(s_ev, EV_IDLE);
     vTaskDelete(NULL);
 }
@@ -206,8 +208,10 @@ bool asr_begin(asr_text_cb_t cb)
     s_cb = cb;
     for (int i = 0; i < 16; i++) sprintf(&s_task_id[2 * i], "%02x", (unsigned)(esp_random() & 0xff));
     mic_start(audio_sink);
+    net_awake(true);
     if (xTaskCreatePinnedToCore(asr_task, "asr", 6144, NULL, 5, NULL, 0) != pdPASS) {
         mic_stop();
+        net_awake(false);
         xEventGroupSetBits(s_ev, EV_IDLE);
         return false;
     }

@@ -16,6 +16,7 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "mic.h"
+#include "net.h"
 #include "settings.h"
 
 static const char *TAG = "tts";
@@ -53,14 +54,46 @@ static const char *s_task_voice;             /* the one the current task speaks 
 
 /* ---- the speaker ---- */
 
+/*
+ * The speaker, with a jitter buffer: playing each packet the moment it came
+ * stuttered whenever the network hiccuped. Start once PRIME of audio is in
+ * (or the synthesis is over), and after running dry wait for REPRIME more.
+ */
+#define PRIME (MIC_RATE * 2 * 300 / 1000)     /* 300 ms */
+#define REPRIME (MIC_RATE * 2 * 200 / 1000)   /* 200 ms */
+static volatile int s_underruns;
+
+static bool synth_over(void) { return xEventGroupGetBits(s_ev) & (EV_FINISHED | EV_FAILED | EV_STOP | EV_IDLE); }
+
 static void player_task(void *arg)
 {
     int16_t *mono = heap_caps_malloc(BLOCK * 2, MALLOC_CAP_INTERNAL);
     int16_t *stereo = heap_caps_malloc(BLOCK * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     esp_codec_dev_handle_t spk = mic_speaker();
+    size_t need = PRIME;   /* buffer this much before playing */
     for (;;) {
-        size_t n = xStreamBufferReceive(s_audio, mono, BLOCK * 2, portMAX_DELAY);
-        if (s_flush) continue;
+        if (need) {
+            if (xStreamBufferBytesAvailable(s_audio) < need && !synth_over()) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            need = 0;
+        }
+        size_t n = xStreamBufferReceive(s_audio, mono, BLOCK * 2, pdMS_TO_TICKS(60));
+        if (s_flush) {
+            need = PRIME;
+            continue;
+        }
+        if (!n) {
+            /* Ran dry: an underrun if more is still coming, else just the end. */
+            if (!synth_over()) {
+                s_underruns++;
+                need = REPRIME;
+            } else {
+                need = PRIME;
+            }
+            continue;
+        }
         s_played += n;
         n /= 2;
         int64_t sq = 0;
@@ -213,7 +246,7 @@ static void tts_task(void *arg)
     if (!sent_any) goto done;
     send_cmd(ws, "finish-task", NULL);
     xEventGroupWaitBits(s_ev, EV_FINISHED | EV_FAILED | EV_STOP, pdFALSE, pdFALSE, pdMS_TO_TICKS(60000));
-    ESP_LOGI(TAG, "done %d ms after start", (int)(esp_log_timestamp() - t0));
+    ESP_LOGI(TAG, "done %d ms after start, %d underruns so far", (int)(esp_log_timestamp() - t0), s_underruns);
     goto done;
 fail:
     ESP_LOGW(TAG, "%s failed%s", why, xEventGroupGetBits(s_ev) & EV_STOP ? " (stopped)" : "");
@@ -223,6 +256,7 @@ done:
     free(headers);
     free(key);
     free(piece);
+    net_awake(false);
     xEventGroupSetBits(s_ev, EV_IDLE);
     vTaskDelete(NULL);
 }
@@ -239,7 +273,7 @@ void tts_init(void)
     s_msg = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
     uint8_t on = 1;
     if (settings_get_blob("voice", &on, 1)) s_enabled = on;
-    xTaskCreatePinnedToCore(player_task, "player", 3072, NULL, 7, NULL, 1);
+    xTaskCreatePinnedToCore(player_task, "player", 3072, NULL, 12, NULL, 1);   /* above the UI: audio mustn't wait on a redraw */
 }
 
 static bool begin_with(const char *voice);
@@ -260,6 +294,8 @@ static bool begin_with(const char *voice)
         return false;
     }
     ESP_LOGI(TAG, "begin (%s)", voice);
+    net_awake(true);   /* no modem sleep while audio streams in */
+    s_underruns = 0;
     s_rx_bytes = s_played = 0;
     s_nsent = 0;
     for (int i = 0; i < MAX_SENTENCES; i++) s_sent_at[i] = -1;
@@ -269,6 +305,7 @@ static bool begin_with(const char *voice)
     s_flush = false;
     for (int i = 0; i < 16; i++) sprintf(&s_task_id[2 * i], "%02x", (unsigned)(esp_random() & 0xff));
     if (xTaskCreatePinnedToCore(tts_task, "tts", 6144, NULL, 5, NULL, 0) != pdPASS) {
+        net_awake(false);
         xEventGroupSetBits(s_ev, EV_IDLE);
         return false;
     }

@@ -5,4 +5,5 @@
  *   >keys?          (prints which are set, never the values)
  *   >reboot
  */
-void console_start(void);
+void console_init_early(void);   /* first thing in app_main */
+void console_start(void);        /* the command task, once the rest is up */

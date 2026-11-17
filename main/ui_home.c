@@ -103,9 +103,9 @@ static lv_obj_t *app(lv_obj_t *scr, int x, int y, uint32_t color, const char *la
     lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x666666), LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(b, 16, 0);
+    lv_obj_set_style_shadow_width(b, 24, 0);
     lv_obj_set_style_shadow_color(b, lv_color_hex(color), 0);
-    lv_obj_set_style_shadow_opa(b, LV_OPA_50, 0);
+    lv_obj_set_style_shadow_opa(b, LV_OPA_60, 0);
     lv_obj_set_style_pad_all(b, 0, 0);
     lv_obj_align(b, LV_ALIGN_CENTER, x, y);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
@@ -142,18 +142,7 @@ void ui_home(void)
     lv_obj_add_event_cb(s_whale, on_whale_tap, LV_EVENT_CLICKED, NULL);   /* she reacts; 小鲸 below opens chat */
     pet_play(s_whale, PET_WAVE, false);   /* hello */
 
-    /* The dock. */
-    lv_obj_t *dock = lv_obj_create(scr);
-    lv_obj_remove_style_all(dock);
-    lv_obj_set_size(dock, 292, 104);
-    lv_obj_set_style_bg_color(dock, lv_color_hex(0x0e1320), 0);
-    lv_obj_set_style_bg_opa(dock, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(dock, 44, 0);
-    lv_obj_set_style_border_color(dock, lv_color_hex(0x1d2638), 0);
-    lv_obj_set_style_border_width(dock, 1, 0);
-    lv_obj_align(dock, LV_ALIGN_CENTER, 0, 128);
-    lv_obj_remove_flag(dock, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
+    /* Three buttons standing on their own (the dock panel behind them looked boxed in). */
     lv_obj_t *b = app(scr, -92, 112, 0x2f5bea, "小鲸", go_chat);
     lv_obj_t *icon = lv_image_create(b);
     lv_image_set_src(icon, &whale_img);

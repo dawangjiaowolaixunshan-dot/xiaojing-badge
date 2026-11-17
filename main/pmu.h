@@ -10,3 +10,5 @@ void pmu_init(void);
 void pmu_key_shutdown(bool on);
 bool pmu_read(int *pct, bool *charging, bool *usb);   /* pct -1 without a battery */
 void pmu_power_off(void);
+int pmu_battery_mv(void);   /* 0 without a battery or PMU */
+void pmu_codecs_off(void);  /* the codecs' rail, before deep sleep (pmu_init turns it back on) */

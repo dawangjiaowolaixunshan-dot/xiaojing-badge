@@ -20,7 +20,9 @@ bool ui_lock(void);
 void ui_unlock(void);
 void ui_settings_changed(void);
 void ui_boot_button(bool pressed);   /* BOOT: back, on release */
-void ui_talk_button(bool pressed);   /* PWR: hold to talk where a screen talks */
+void ui_talk_button(bool pressed);
+bool ui_screen_on(void);
+void ui_prepare_deep_sleep(void);   /* PWR: hold to talk where a screen talks */
 
 /* Helpers for the screens (call with the lock held). */
 lv_obj_t *ui_screen(void);

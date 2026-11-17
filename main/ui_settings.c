@@ -8,6 +8,8 @@
 
 #include "bsp/display.h"
 #include "chat.h"
+#include "mic.h"
+#include "voices.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "net.h"
@@ -145,12 +147,83 @@ static void on_sleep(lv_event_t *e)
 
 static void on_restart(lv_event_t *e) { esp_restart(); }
 
+/* ---- 认识声音: each of the family says a line once ---- */
+
+static voice_who_t s_enroll_who;
+static lv_obj_t *s_enroll_lbl;
+
+static void no_sink(const int16_t *pcm, size_t n) {}
+
+static void enroll_talk(bool pressed)
+{
+    if (!s_enroll_lbl) return;
+    if (pressed) {
+        mic_pitch_begin();
+        mic_start(no_sink);
+        lv_label_set_text(s_enroll_lbl, "正在听…说完松开");
+        return;
+    }
+    mic_stop();
+    int hz = mic_pitch_end();
+    char buf[160];
+    if (!hz) {
+        snprintf(buf, sizeof(buf), "没听清，按住 PWR 再说一句长一点的话");
+    } else {
+        voices_enroll(s_enroll_who, hz);
+        int n = snprintf(buf, sizeof(buf), "记住啦！%s的声音大约 %d Hz", voices_name(s_enroll_who), hz);
+        for (int i = 0; i < VOICE_COUNT; i++) {
+            int other = voices_enrolled_hz(i);
+            if (i == (int)s_enroll_who || !other) continue;
+            float r = (float)hz / other;
+            if (r > 0.88f && r < 1.14f) {   /* within two semitones or so */
+                n += snprintf(buf + n, sizeof(buf) - n, "\n和%s（%d Hz）很接近，可能会分不清", voices_name(i), other);
+            }
+        }
+    }
+    lv_label_set_text(s_enroll_lbl, buf);
+}
+
+static void enroll_back(void) { s_enroll_lbl = NULL; ui_settings(); }
+
+static void open_enroll(voice_who_t who)
+{
+    s_enroll_who = who;
+    lv_obj_t *scr = ui_screen();
+    ui_back_button(scr);
+    char buf[160];
+    snprintf(buf, sizeof(buf), "录入%s的声音", voices_name(who));
+    lv_obj_t *t = ui_label(scr, &g_font_text, C_ACCENT, buf);
+    lv_obj_align(t, LV_ALIGN_CENTER, 0, -150);
+    snprintf(buf, sizeof(buf), "请%s按住侧面的 PWR 键，\n说一句话，比如\n“小鲸你好，我是%s”，\n说完松开。",
+             who == VOICE_CHILD ? "孩子" : who == VOICE_DAD ? "爸爸" : "妈妈", who == VOICE_CHILD ? "小主人" : voices_name(who));
+    lv_obj_t *h = ui_label(scr, &g_font_text, C_TEXT, buf);
+    lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(h, LV_ALIGN_CENTER, 0, -40);
+    s_enroll_lbl = ui_label(scr, &g_font_text, C_GREEN, "");
+    lv_obj_set_width(s_enroll_lbl, 320);
+    lv_label_set_long_mode(s_enroll_lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_align(s_enroll_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_enroll_lbl, LV_ALIGN_CENTER, 0, 100);
+    ui_show(scr, enroll_back, enroll_talk);
+}
+
+static void on_enroll(lv_event_t *e) { open_enroll((voice_who_t)(intptr_t)lv_event_get_user_data(e)); }
+
 static void on_new_chat(lv_event_t *e)
 {
     chat_reset();   /* 小鲸 forgets this conversation; the record stays */
     lv_label_set_text(lv_obj_get_child(lv_event_get_target(e), 0), "已开始新对话");
 }
 static void on_power_off(lv_event_t *e) { pmu_power_off(); }
+
+static lv_obj_t *pill_ud(const char *text, uint32_t bg, lv_event_cb_t cb, void *ud)
+{
+    lv_obj_t *b = ui_button(s_cur, NULL, &g_font_text, 240, 46, bg, cb, ud);
+    lv_obj_set_style_margin_ver(b, 4, 0);
+    lv_obj_t *l = ui_label(b, &g_font_text, 0xffffff, text);
+    lv_obj_center(l);
+    return b;
+}
 
 static lv_obj_t *pill(const char *text, uint32_t bg, lv_event_cb_t cb, lv_obj_t **label)
 {
@@ -208,6 +281,15 @@ void ui_settings(void)
     pill(PREFS_VOICE_NAMES[g_prefs.voice], C_BLUE, on_chat_voice, NULL);
     row_title("古诗朗读音色");
     pill(PREFS_VOICE_NAMES[g_prefs.poem_voice], C_ACCENT, on_poem_voice, NULL);
+
+    card("认识声音");
+    row_title("每人按住 PWR 说一句，小鲸就分得清谁在说话");
+    for (int i = 0; i < VOICE_COUNT; i++) {
+        int hz = voices_enrolled_hz(i);
+        if (hz) snprintf(buf, sizeof(buf), "%s  已录（%d Hz）", voices_name(i), hz);
+        else snprintf(buf, sizeof(buf), "录入%s的声音", voices_name(i));
+        pill_ud(buf, hz ? C_PANEL : 0x2f5bea, on_enroll, (void *)(intptr_t)i);
+    }
 
     card("省电");
     row_title("自动熄屏（点一下换）");

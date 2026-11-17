@@ -20,6 +20,8 @@
 #include "settings.h"
 #include "tts.h"
 #include "ui.h"
+#include "power.h"
+#include "voices.h"
 #include "weather.h"
 
 static const char *TAG = "app";
@@ -95,21 +97,26 @@ static void heartbeat_task(void *arg)
 
 void app_main(void)
 {
+    console_init_early();
+    power_log_wake();
     /* 240 MHz when busy, 80 MHz when idle; no light sleep (it would cut the
      * USB console and the display's refresh). */
     esp_pm_config_t pm = {.max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false};
     if (esp_pm_configure(&pm) != ESP_OK) ESP_LOGW(TAG, "no frequency scaling");
+    else ESP_LOGI(TAG, "CPU 80-240 MHz");
     settings_init();
     poems_init();
     pet_init();
     history_init();
     chat_restore();
     history_recall_init();
+    voices_init();
     ui_start();
     pmu_init();
     console_start();
     net_start();
     weather_start();
+    power_start();
     if (!mic_init()) {
         ESP_LOGE(TAG, "no microphone: DeepSeek can't listen");
     }

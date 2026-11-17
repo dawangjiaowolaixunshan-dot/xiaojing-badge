@@ -17,6 +17,7 @@
 #include "net.h"
 #include "settings.h"
 #include "tts.h"
+#include "voices.h"
 #include "ui.h"
 
 static const char *TAG = "ui_chat";
@@ -35,7 +36,7 @@ static bool s_oneshot;
 static void play_once(pet_clip_t c);
 static char s_qbuf[1100];
 static char *s_wrap;   /* wrapped copy for a label, PSRAM */
-#define BOX_W 340
+#define BOX_W 320   /* the bezel covers the screen's very edge: keep clear of it */
 #define WRAP_CAP 6144
 
 /*
@@ -85,7 +86,6 @@ static const char *wrap_to(const char *src, int width)
 }
 
 #define BUBBLE_W (BOX_W + 20)   /* an answer's text: the box's width (wrap_to keeps 24 px for hanging marks) */
-#define MINE_W 280             /* a question's, to the right */
 static const char *wrap(const char *src) { return wrap_to(src, BUBBLE_W); }
 
 /* What's happening, in a line under her: shown only while something is. */
@@ -129,7 +129,7 @@ static lv_obj_t *add_text(const char *text, uint32_t color, bool centre)
 
 /* A message, no bubble round it: a bubble's fill and padding took a fifth
  * of the circle's widest band. 小鲸's answers use the full width in white;
- * the child's questions are blue and to the right. Returns the label; its
+ * the child's questions are blue. Returns the label; its
  * parent is the full-width row. */
 static lv_obj_t *add_bubble(const char *text, bool mine)
 {
@@ -137,14 +137,15 @@ static lv_obj_t *add_bubble(const char *text, bool mine)
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, BOX_W, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, mine ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *b = lv_obj_create(row);   /* kept as a wrapper so callers can find the row */
     lv_obj_remove_style_all(b);
     lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *l = ui_label(b, &g_font_text, mine ? 0x7fb2ff : 0xf2f2f2, mine ? wrap_to(text, MINE_W) : wrap(text));
-    if (mine) lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
+    /* Both full width, left-aligned: the colour says who; right-aligned,
+     * a short question left the round screen's left half empty. */
+    lv_obj_t *l = ui_label(b, &g_font_text, mine ? 0x7fb2ff : 0xf2f2f2, wrap(text));
     keep_footer_last();
     return l;
 }
@@ -157,7 +158,7 @@ static void add_pair(const char *q, const char *a)
     }
     s_q = add_bubble(q[0] ? q : "…", true);
     lv_obj_set_style_margin_top(lv_obj_get_parent(lv_obj_get_parent(s_q)), 6, 0);
-    s_a = add_bubble(a[0] ? a : "…", false);
+    s_a = add_bubble(a, false);   /* empty until the answer starts */
 }
 
 static void add_divider(void)
@@ -249,7 +250,7 @@ static void on_asr(const char *text, bool final)
     }
     if (!final) {
         snprintf(s_qbuf, sizeof(s_qbuf), "%s", text[0] ? text : "…");
-        if (s_q) lv_label_set_text(s_q, wrap_to(s_qbuf, MINE_W));
+        if (s_q) lv_label_set_text(s_q, wrap(s_qbuf));
         scroll_down();
     } else if (!text) {
         s_mode = W_IDLE;
@@ -261,7 +262,7 @@ static void on_asr(const char *text, bool final)
         set_status("没听清，再说一次", C_DIM);
     } else {
         snprintf(s_qbuf, sizeof(s_qbuf), "%s", text);
-        if (s_q) lv_label_set_text(s_q, wrap_to(s_qbuf, MINE_W));
+        if (s_q) lv_label_set_text(s_q, wrap(s_qbuf));
         s_spoken = 0;
         s_speaking = tts_begin();   /* connects while DeepSeek starts writing */
         if (chat_ask(text, on_reply, on_reply_done)) {
@@ -301,6 +302,7 @@ static void talk(bool down)
             set_status("没设置密钥", C_RED);
             return;
         }
+        mic_pitch_begin();   /* who's speaking, from their pitch */
         if (!asr_begin(on_asr)) {
             set_status("稍等一下再说", C_DIM);
             return;
@@ -314,6 +316,7 @@ static void talk(bool down)
         s_listening = false;
         s_mode = W_THINK;
         asr_end();
+        chat_set_speaker(voices_classify(mic_pitch_end()));
         set_status("识别中…", C_DIM);
     }
 }
@@ -385,13 +388,13 @@ void ui_chat(void)
     /* No buttons: PWR talks, new conversations start by themselves, BOOT or
      * a swipe right goes back. The list runs to the bottom of the circle,
      * padded so the newest message sits above where it narrows. */
-    lv_obj_set_size(s_box, BOX_W, 350);
-    lv_obj_align(s_box, LV_ALIGN_CENTER, 0, 42);
+    lv_obj_set_size(s_box, BOX_W, 316);
+    lv_obj_align(s_box, LV_ALIGN_CENTER, 0, 40);   /* -118..198: below the status line, never under it */
     lv_obj_set_flex_flow(s_box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(s_box, 10, 0);
-    lv_obj_set_style_pad_top(s_box, 22, 0);   /* clear of the status line */
-    lv_obj_set_style_pad_bottom(s_box, 56, 0);
+    lv_obj_set_style_pad_top(s_box, 4, 0);
+    lv_obj_set_style_pad_bottom(s_box, 78, 0);   /* the newest line rests above where the circle narrows */
     lv_obj_set_scroll_dir(s_box, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_box, LV_SCROLLBAR_MODE_OFF);
     s_footer = NULL;

@@ -13,6 +13,11 @@ static const char *TAG = "pmu";
 #define REG_IRQ_LEVEL 0x27    /* bits 3:2: hold-off; 11 = 10 s */
 #define REG_ADC_ENABLE 0x30   /* bit0 battery voltage */
 #define REG_BAT_PERCENT 0xA4
+#define REG_VBAT_H 0x34      /* bits 4:0; 1 mV per count with REG_VBAT_L */
+#define REG_VBAT_L 0x35
+#define REG_DCDC_ONOFF 0x80  /* bits 4:0 = DCDC5..1 */
+#define REG_LDO_ONOFF0 0x90  /* ALDO1-4, BLDO1-2, CPUSLDO, DLDO1 from bit 0 */
+#define REG_LDO_ONOFF1 0x91  /* bit 0 = DLDO2 */
 #define REG_INTEN1 0x40
 #define REG_INTSTS1 0x48
 
@@ -50,6 +55,16 @@ void pmu_init(void)
         wr(REG_INTSTS1 + i, 0xff);
     }
     if (rd(REG_ADC_ENABLE, &v) == ESP_OK) wr(REG_ADC_ENABLE, v | 0x01);   /* the fuel gauge needs it */
+    /* Only DCDC1 (3.3 V for everything) and ALDO1 (the codecs) feed anything
+     * on this board; Muse turns the rest off too. ALDO1 back on in case a
+     * deep sleep left it off. */
+    uint8_t dc, l0, l1;
+    if (rd(REG_DCDC_ONOFF, &dc) == ESP_OK && rd(REG_LDO_ONOFF0, &l0) == ESP_OK && rd(REG_LDO_ONOFF1, &l1) == ESP_OK) {
+        wr(REG_DCDC_ONOFF, dc & 0xE1);
+        wr(REG_LDO_ONOFF0, 0x01);
+        wr(REG_LDO_ONOFF1, l1 & ~0x01);
+        ESP_LOGI(TAG, "rails: DCDC %02x -> %02x, LDO %02x -> 01", dc & 0x1F, dc & 0x01, l0);
+    }
     ESP_LOGI(TAG, "PWR hold-off 10 s");
 }
 
@@ -85,4 +100,17 @@ void pmu_power_off(void)
 {
     uint8_t v;
     if (s_dev && rd(REG_COMMON_CFG, &v) == ESP_OK) wr(REG_COMMON_CFG, (v & ~0x03) | 0x01);
+}
+
+int pmu_battery_mv(void)
+{
+    uint8_t hi, lo;
+    if (!s_dev || rd(REG_VBAT_H, &hi) != ESP_OK || rd(REG_VBAT_L, &lo) != ESP_OK) return 0;
+    return (hi & 0x1F) << 8 | lo;
+}
+
+void pmu_codecs_off(void)
+{
+    uint8_t v;
+    if (s_dev && rd(REG_LDO_ONOFF0, &v) == ESP_OK) wr(REG_LDO_ONOFF0, v & ~0x01);   /* ALDO1 */
 }

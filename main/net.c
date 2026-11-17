@@ -14,6 +14,7 @@
 
 static const char *TAG = "net";
 static EventGroupHandle_t s_ev;
+static volatile bool s_suspended;   /* radio off while the screen is dark */
 #define EV_UP BIT0
 
 /* Slot 0 is home Wi-Fi, slot 1 the phone hotspot. After FAILS_BEFORE_SWITCH
@@ -55,6 +56,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_ev, EV_UP);
+        if (s_suspended) return;
         wifi_event_sta_disconnected_t *d = data;
         ESP_LOGW(TAG, "disconnected (reason %d); retrying", d->reason);
         /* A disconnect we asked for (net_reconnect) is not a failure. */
@@ -132,4 +134,31 @@ int net_rssi(void)
 {
     wifi_ap_record_t ap;
     return net_up() && esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : -127;
+}
+
+/* Modem sleep saves battery but delays packets: off while audio streams
+ * (speech recognition, reading aloud). Counted, so overlapping users nest. */
+void net_awake(bool on)
+{
+    static int users;
+    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    taskENTER_CRITICAL(&mux);
+    users += on ? 1 : -1;
+    if (users < 0) users = 0;
+    int now = users;
+    taskEXIT_CRITICAL(&mux);
+    esp_wifi_set_ps(now ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+}
+
+void net_suspend(bool off)
+{
+    if (off == s_suspended) return;
+    s_suspended = off;
+    if (off) {
+        esp_wifi_stop();
+        ESP_LOGI(TAG, "radio off (screen dark)");
+    } else {
+        esp_wifi_start();   /* STA_START connects */
+        ESP_LOGI(TAG, "radio on");
+    }
 }

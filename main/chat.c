@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "history.h"
 #include "net.h"
+#include "voices.h"
 #include "weather.h"
 #include "settings.h"
 
@@ -31,7 +32,9 @@ static const char *FORMAT_RULES =
     "\n\n输出要求：回答会被念出来，同时显示在小屏上。用简体中文口语；"
     "简单的问题一两句话说完，复杂的问题可以讲清楚，但最多300字。"
     "不要用Markdown、标题、列表符号、表格和表情符号，不要换行分段。"
-    "如果上网搜索了，用自己的话简单概括，不要念网址、来源编号，也不要大段照搬原文。";
+    "如果上网搜索了，用自己的话简单概括，不要念网址、来源编号，也不要大段照搬原文。"
+    "\n\n家人：问题后面会注明说话的是谁。孩子是你的小主人；如果是爸爸或妈妈，就称呼“爸爸”“妈妈”，"
+    "用跟大人说话的自然口吻，可以说得更直接，但其他规则照样遵守。没有注明时，按孩子对待。";
 
 typedef struct {
     char *q, *a;
@@ -39,6 +42,7 @@ typedef struct {
 
 static turn_t s_hist[HISTORY];
 static int s_nhist;
+static voice_who_t s_who = VOICE_UNKNOWN;   /* who asked this question */
 
 static volatile bool s_busy;
 static bool s_filtered;   /* DeepSeek's review stopped the answer */
@@ -115,10 +119,13 @@ static char *build_body(void)
         size_t qn = strlen(s_question) + 256 + (recall ? strlen(recall) + 64 : 0);
         char *q = heap_caps_malloc(qn, MALLOC_CAP_SPIRAM);
         if (q) {
-            int at = snprintf(q, qn, "%s\n（现在是北京时间 %d年%d月%d日 星期%s %02d:%02d%s%s）", s_question, tm.tm_year + 1900,
-                     tm.tm_mon + 1, tm.tm_mday, WEEK[tm.tm_wday], tm.tm_hour, tm.tm_min, wx[0] ? "；天气 " : "", wx);
+            int at = snprintf(q, qn, "%s\n（背景信息，只在问到时间、日期、天气、穿衣或出门时才用，平时不要提：%s%s%s现在是北京时间 %d年%d月%d日 星期%s %02d:%02d%s%s）", s_question,
+                     s_who != VOICE_UNKNOWN ? "说话的是：" : "", s_who != VOICE_UNKNOWN ? voices_name(s_who) : "",
+                     s_who != VOICE_UNKNOWN ? "；" : "",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, WEEK[tm.tm_wday], tm.tm_hour, tm.tm_min,
+                     wx[0] ? "；天气 " : "", wx);
             if (recall && recall[0] && at > 0 && (size_t)at < qn) {
-                snprintf(q + at, qn - at, "\n（你们以前聊过的相关内容，需要时可参考：\n%s）", recall);
+                snprintf(q + at, qn - at, "\n（以前聊过的相关内容，只在这次问题用得上时参考，不要主动复述：\n%s）", recall);
             }
             add_msg(msgs, "user", q);
             free(q);
@@ -283,7 +290,7 @@ static void chat_task(void *arg)
         error = "DeepSeek 没有回答";
     } else {
         remember();
-        history_add(s_question, s_reply);
+        history_add(s_question, s_reply, voices_key(s_who));
     }
 done:
     esp_http_client_cleanup(http);
@@ -326,3 +333,5 @@ void chat_reset(void)
 bool chat_busy(void) { return s_busy; }
 
 void chat_on_search(chat_search_cb_t cb) { s_on_search = cb; }
+
+void chat_set_speaker(int who) { s_who = (voice_who_t)who; }

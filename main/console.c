@@ -14,6 +14,7 @@
 #include "history.h"
 #include "net.h"
 #include "pet.h"
+#include "power.h"
 #include "prefs.h"
 #include "tts.h"
 #include "settings.h"
@@ -61,6 +62,8 @@ static int b64_decode(const char *in, char *out, size_t cap)
     }
     return (int)o;
 }
+
+static void power_line(const char *line) { printf("@pw %s\n", line); vTaskDelay(1); }
 
 static int s_dump_n;
 
@@ -155,6 +158,14 @@ static void handle(char *line)
         else ui_home();
         ui_unlock();
         printf("@ok screen\n");
+    } else if (!strncmp(line, "chatvoice=", 10)) {   /* pick 小鲸's voice by index (as in 设置) */
+        int i = atoi(line + 10);
+        if (i >= 0 && i < PREFS_VOICE_N) {
+            g_prefs.voice = (uint8_t)i;
+            prefs_save();
+            tts_set_voice(PREFS_VOICES[i]);
+        }
+        printf("@ok chatvoice %d\n", i);
     } else if (!strncmp(line, "voicetest=", 10)) {   /* speak a line in voice N, to check the id works */
         int i = atoi(line + 10);
         if (i >= 0 && i < PREFS_VOICE_N) tts_say_with(PREFS_VOICES[i], "你好");
@@ -192,6 +203,24 @@ static void handle(char *line)
         ui_lock();
         ui_poem_read();
         ui_unlock();
+    } else if (!strncmp(line, "sleepidx=", 9) || !strcmp(line, "prefs?")) {   /* auto screen-off: 0 never,1 30s,2 1m,3 3m */
+        if (line[0] == 's') {
+            int i = atoi(line + 9);
+            if (i >= 0 && i < PREFS_SLEEP_N) {
+                g_prefs.sleep = (uint8_t)i;
+                prefs_save();
+            }
+        }
+        printf("@prefs bright=%d vol=%d sleep=%d voice=%d poem=%d\n", g_prefs.brightness, g_prefs.volume,
+               g_prefs.sleep, g_prefs.voice, g_prefs.poem_voice);
+    } else if (!strncmp(line, "wake", 4)) {   /* as if touched */
+        ui_lock();
+        lv_display_trigger_activity(NULL);
+        ui_unlock();
+        printf("@ok wake\n");
+    } else if (!strcmp(line, "powerdump")) {   /* "@pw <line>" each, then "@pw_end" */
+        power_dump(power_line);
+        printf("@pw_end\n");
     } else if (!strcmp(line, "petdbg")) {
         ui_lock();
         pet_debug();
@@ -221,7 +250,15 @@ static void console_task(void *arg)
     }
 }
 
-void console_start(void)
+static bool s_driver;
+
+/*
+ * The USB serial driver goes in first thing in app_main, before Wi-Fi, the
+ * display and the other tasks: installed late, its interrupt allocation hit
+ * the interrupt watchdog at boot (a boot loop), with everything else already
+ * running and logging.
+ */
+void console_init_early(void)
 {
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     cfg.rx_buffer_size = 1024;
@@ -236,5 +273,11 @@ void console_start(void)
      * it (the chat stopped showing text, the UI stalled). The driver path
      * drops output after 50 ms with no host instead of blocking. */
     usb_serial_jtag_vfs_use_driver();
+    s_driver = true;
+}
+
+void console_start(void)
+{
+    if (!s_driver) return;
     xTaskCreate(console_task, "console", 8192, NULL, 3, NULL);   /* >shot takes a snapshot on this stack */
 }

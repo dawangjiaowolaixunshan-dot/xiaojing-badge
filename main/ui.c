@@ -13,6 +13,8 @@
 #include "chat.h"
 #include "net.h"
 #include "pet.h"
+#include "pmu.h"
+#include "power.h"
 #include "prefs.h"
 #include "tts.h"
 
@@ -85,6 +87,9 @@ void ui_back_button(lv_obj_t *scr)
 /* ---- Screen off when idle ---- */
 
 static bool s_asleep, s_dimmed;
+static uint32_t s_asleep_at;   /* lv_tick when the screen went dark */
+static bool s_frozen;          /* the whale held still: nobody's looking */
+#define FREEZE_MS 20000
 static esp_lcd_panel_handle_t s_panel;   /* set by display_start() */
 static lv_obj_t *s_wake_cover;   /* catches the touch that wakes, so it presses nothing */
 
@@ -97,7 +102,9 @@ static void wake(void)
     }
     if (s_asleep && s_panel) esp_lcd_panel_disp_on_off(s_panel, true);
     if (s_asleep || s_dimmed) bsp_display_brightness_set(g_prefs.brightness);
-    if (s_asleep) pet_set_paused(false);
+    if (s_asleep) net_suspend(false);
+    if (s_asleep || s_frozen) pet_set_paused(false);
+    s_frozen = false;
     s_asleep = s_dimmed = false;
 }
 
@@ -109,6 +116,14 @@ static void sleep_timer(lv_timer_t *t)
     if (chat_busy() || tts_active() || ui_chat_listening()) lv_display_trigger_activity(NULL);
     int limit = PREFS_SLEEP_S[g_prefs.sleep] * 1000;
     uint32_t idle = lv_display_get_inactive_time(NULL);
+    /* Nobody touching it for a while: hold the whale still (fewer redraws). */
+    if (!s_frozen && !s_asleep && idle > FREEZE_MS) {
+        s_frozen = true;
+        pet_set_paused(true);
+    } else if (s_frozen && idle < 1000) {
+        s_frozen = false;
+        pet_set_paused(false);
+    }
     if (!limit || idle < 1000) {
         if ((s_asleep || s_dimmed) && idle < 1000) wake();
         return;
@@ -118,6 +133,8 @@ static void sleep_timer(lv_timer_t *t)
         bsp_display_brightness_set(0);
         if (s_panel) esp_lcd_panel_disp_on_off(s_panel, false);   /* the panel itself off, not just dark */
         pet_set_paused(true);                                     /* and no frames drawn for nobody */
+        net_suspend(true);                                        /* nor a radio kept up for nobody */
+        s_asleep_at = lv_tick_get();
         s_wake_cover = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(s_wake_cover);
         lv_obj_set_size(s_wake_cover, LV_PCT(100), LV_PCT(100));
@@ -253,4 +270,12 @@ void ui_start(void)
     ui_home();
     lv_timer_create(sleep_timer, 500, NULL);
     ui_unlock();
+}
+
+bool ui_screen_on(void) { return !s_asleep; }
+
+void ui_prepare_deep_sleep(void)
+{
+    if (s_panel) esp_lcd_panel_disp_sleep(s_panel, true);
+    tts_stop();
 }

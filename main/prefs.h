@@ -13,7 +13,7 @@ typedef struct {
 #define PREFS_SLEEP_N 4
 extern const int PREFS_SLEEP_S[PREFS_SLEEP_N];          /* 0 = never */
 extern const char *const PREFS_SLEEP_NAMES[PREFS_SLEEP_N];
-#define PREFS_VOICE_N 10
+#define PREFS_VOICE_N 13
 extern const char *const PREFS_VOICES[PREFS_VOICE_N];
 extern const char *const PREFS_VOICE_NAMES[PREFS_VOICE_N];
 

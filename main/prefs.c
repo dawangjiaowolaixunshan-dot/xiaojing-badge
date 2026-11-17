@@ -10,13 +10,15 @@ const char *const PREFS_SLEEP_NAMES[PREFS_SLEEP_N] = {"不熄屏", "30 秒", "1 
 const char *const PREFS_VOICES[PREFS_VOICE_N] = {
     "longhua_v2", "longxiaochun_v2", "longjielidou_v2", "longniuniu", "longhuhu",
     "longpaopao", "longhouge", "longjiqi", "libai_v2", "longfei_v2",
+    "longxiaoxia_v2", "longyue_v2", "longanya",
 };
 const char *const PREFS_VOICE_NAMES[PREFS_VOICE_N] = {
     "龙华 · 元气女声", "龙小淳 · 知性女声", "龙杰力豆 · 顽皮男孩", "龙牛牛 · 阳光男童", "龙呼呼 · 可爱女童",
     "龙泡泡 · 泡泡音", "龙猴哥 · 猴哥", "龙机器 · 呆萌机器人", "李白 · 诗仙", "龙飞 · 朗诵男声",
+    "龙小夏 · 沉稳御姐", "龙悦 · 温暖磁性", "龙安雅 · 高雅气质",
 };
 
-prefs_t g_prefs = {.brightness = 80, .volume = 75, .sleep = 2, .voice = 0, .poem_voice = 8};
+prefs_t g_prefs = {.brightness = 60, .volume = 75, .sleep = 1, .voice = 10, .poem_voice = 8};
 
 void prefs_load(void)
 {

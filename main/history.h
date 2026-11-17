@@ -10,7 +10,7 @@
 #define HISTORY_SHOW 30
 
 void history_init(void);
-void history_add(const char *q, const char *a);
+void history_add(const char *q, const char *a, const char *who);   /* who: child/dad/mom or NULL */
 void history_divider(void);
 /* The last `max` entries, oldest first; q == NULL marks a divider. */
 void history_each(int max, void (*fn)(const char *q, const char *a, void *ctx), void *ctx);
