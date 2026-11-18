@@ -9,7 +9,14 @@
 #include "bsp/touch.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
+#include <stdlib.h>
 #include "esp_lv_adapter.h"
+#include "esp_pm.h"
+#include "esp_timer.h"
 #include "chat.h"
 #include "net.h"
 #include "pet.h"
@@ -110,6 +117,50 @@ static void wake(void)
 
 static void on_wake_cover(lv_event_t *e) { wake(); }
 
+/*
+ * Frequency scaling lets the CPU idle at 80 MHz, and LVGL then draws a swipe
+ * at a third of the speed. Hold it at full speed while the screen is touched
+ * or anything is animating, and let it drop again a moment after.
+ */
+static esp_pm_lock_handle_t s_fast_lock;
+static bool s_fast;
+
+static void fast_timer(lv_timer_t *t)
+{
+    bool want = !s_asleep && (lv_display_get_inactive_time(NULL) < 1500 || lv_anim_count_running() > 0);
+    if (want == s_fast || !s_fast_lock) return;
+    s_fast = want;
+    if (want) esp_pm_lock_acquire(s_fast_lock);
+    else esp_pm_lock_release(s_fast_lock);
+}
+
+/* Frame times, for >scrolltest: from the start of a refresh to its last flush. */
+static int64_t s_refr_at;
+static int s_frames, s_frame_max_us;
+static int64_t s_frame_sum_us;
+static void on_refr(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_REFR_START) {
+        s_refr_at = esp_timer_get_time();
+    } else if (s_refr_at) {
+        int us = (int)(esp_timer_get_time() - s_refr_at);
+        s_refr_at = 0;
+        if (lv_display_get_refr_timer(NULL) && us > 200) {   /* a refresh that drew something */
+            s_frames++;
+            s_frame_sum_us += us;
+            if (us > s_frame_max_us) s_frame_max_us = us;
+        }
+    }
+}
+
+void ui_frames_reset(void) { s_frames = 0; s_frame_sum_us = 0; s_frame_max_us = 0; }
+void ui_frames_get(int *frames, int *avg_us, int *max_us)
+{
+    *frames = s_frames;
+    *avg_us = s_frames ? (int)(s_frame_sum_us / s_frames) : 0;
+    *max_us = s_frame_max_us;
+}
+
 static void sleep_timer(lv_timer_t *t)
 {
     /* Talking, thinking or reading aloud counts as use. */
@@ -204,6 +255,136 @@ static void round_area(lv_event_t *e)
 }
 
 /*
+ * Tear-free updates. The CO5300's TE output is wired to GPIO 13 (not in the
+ * BSP; found with >teprobe): a pulse each time the panel starts a scan, ~57
+ * times a second. LVGL draws the changed areas into a full-screen buffer in
+ * PSRAM (direct mode); when a frame is complete, each area goes over the bus
+ * either before the scan reaches it or just after the scan has passed it, so
+ * the panel never shows half an update. Areas were sent strip by strip as
+ * they were drawn before, and a swipe showed as bands sweeping down.
+ */
+#define TE_GPIO 13
+#define BOUNCE_ROWS 24             /* rows per transfer, through internal DMA RAM */
+#define LCD_W BSP_LCD_H_RES
+#define LCD_H BSP_LCD_V_RES
+#define MAX_AREAS 32
+static uint16_t *s_fb;
+static uint8_t *s_bounce[2];
+static SemaphoreHandle_t s_te_sem, s_buf_free;
+static volatile int64_t s_te_at;
+static volatile int32_t s_te_period = 17500;   /* us, measured */
+static esp_lcd_panel_handle_t s_te_panel;
+static lv_area_t s_areas[MAX_AREAS];
+static int s_nareas;
+
+static void IRAM_ATTR on_te(void *arg)
+{
+    int64_t now = esp_timer_get_time();
+    int64_t d = now - s_te_at;
+    if (d > 8000 && d < 40000) s_te_period = (s_te_period * 7 + (int32_t)d) / 8;
+    s_te_at = now;
+    BaseType_t woke = pdFALSE;
+    xSemaphoreGiveFromISR(s_te_sem, &woke);
+    if (woke) portYIELD_FROM_ISR();
+}
+
+static bool IRAM_ATTR on_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *e, void *ctx)
+{
+    BaseType_t woke = pdFALSE;
+    xSemaphoreGiveFromISR(s_buf_free, &woke);
+    return woke == pdTRUE;
+}
+
+static void send_area(const lv_area_t *a)
+{
+    int w = a->x2 - a->x1 + 1;
+    static int k;
+    for (int y = a->y1; y <= a->y2; y += BOUNCE_ROWS) {
+        int rows = a->y2 + 1 - y < BOUNCE_ROWS ? a->y2 + 1 - y : BOUNCE_ROWS;
+        xSemaphoreTake(s_buf_free, portMAX_DELAY);
+        uint16_t *dst = (uint16_t *)s_bounce[k];
+        for (int r = 0; r < rows; r++) {
+            const uint16_t *src = s_fb + (y + r) * LCD_W + a->x1;
+            for (int i = 0; i < w; i++) dst[i] = (uint16_t)(src[i] << 8 | src[i] >> 8);   /* the panel takes RGB565 big-endian */
+            dst += w;
+        }
+        esp_lcd_panel_draw_bitmap(s_te_panel, a->x1, y, a->x2 + 1, y + rows, s_bounce[k]);
+        k ^= 1;
+    }
+}
+
+static int cmp_area(const void *a, const void *b) { return ((const lv_area_t *)a)->y1 - ((const lv_area_t *)b)->y1; }
+
+static void wait_until(int64_t t)
+{
+    int64_t now;
+    while ((now = esp_timer_get_time()) < t) {
+        if (t - now > 2000) vTaskDelay(1);
+        else esp_rom_delay_us((uint32_t)(t - now));
+    }
+}
+
+static void te_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px)
+{
+    if (s_nareas < MAX_AREAS) {
+        s_areas[s_nareas++] = *area;
+    } else {   /* too many: grow the last into a box around them */
+        lv_area_t *l = &s_areas[MAX_AREAS - 1];
+        lv_area_t u = {LV_MIN(l->x1, area->x1), LV_MIN(l->y1, area->y1), LV_MAX(l->x2, area->x2), LV_MAX(l->y2, area->y2)};
+        *l = u;
+    }
+    if (!lv_display_flush_is_last(disp)) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+    qsort(s_areas, s_nareas, sizeof(lv_area_t), cmp_area);
+    xSemaphoreTake(s_te_sem, 0);                              /* a stale pulse */
+    bool synced = xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(30)) == pdTRUE;   /* none when the panel is off */
+    int64_t t0 = s_te_at;
+    float row_us = s_te_period * 0.92f / LCD_H;               /* the scan, leaving a little for blanking */
+    for (int i = 0; i < s_nareas; i++) {
+        const lv_area_t *a = &s_areas[i];
+        if (synced) {
+            int64_t now = esp_timer_get_time() - t0;
+            float send_us = (float)lv_area_get_size(a) / 10.0f + 60.0f * ((a->y2 - a->y1) / BOUNCE_ROWS + 1);   /* 20 MB/s */
+            bool ahead = now + send_us < a->y1 * row_us;      /* done before the scan gets there */
+            if (!ahead) wait_until(t0 + (int64_t)((a->y2 + 2) * row_us));   /* else right behind it */
+        }
+        send_area(a);
+    }
+    for (int i = 0; i < 2; i++) xSemaphoreTake(s_buf_free, portMAX_DELAY);   /* all sent */
+    for (int i = 0; i < 2; i++) xSemaphoreGive(s_buf_free);
+    s_nareas = 0;
+    lv_display_flush_ready(disp);
+}
+
+static bool te_start(lv_display_t *disp, esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t io)
+{
+    size_t fb_bytes = LCD_W * LCD_H * 2;
+    s_fb = heap_caps_aligned_alloc(64, fb_bytes, MALLOC_CAP_SPIRAM);
+    for (int i = 0; i < 2; i++) s_bounce[i] = heap_caps_malloc(LCD_W * BOUNCE_ROWS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_te_sem = xSemaphoreCreateBinary();
+    s_buf_free = xSemaphoreCreateCounting(2, 2);
+    if (!s_fb || !s_bounce[0] || !s_bounce[1] || !s_te_sem || !s_buf_free) {
+        ESP_LOGE(TAG, "tear-free display: no memory");
+        return false;
+    }
+    memset(s_fb, 0, fb_bytes);
+    s_te_panel = panel;
+    esp_lcd_panel_io_callbacks_t cbs = {.on_color_trans_done = on_trans_done};
+    esp_lcd_panel_io_register_event_callbacks(io, &cbs, NULL);
+    gpio_config_t te = {.pin_bit_mask = 1ULL << TE_GPIO, .mode = GPIO_MODE_INPUT, .intr_type = GPIO_INTR_POSEDGE};
+    gpio_config(&te);
+    esp_err_t r = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) return false;
+    gpio_isr_handler_add(TE_GPIO, on_te, NULL);
+    lv_display_set_buffers(disp, s_fb, NULL, fb_bytes, LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_flush_cb(disp, te_flush);
+    ESP_LOGI(TAG, "tear-free display: TE on GPIO %d, direct mode", TE_GPIO);
+    return true;
+}
+
+/*
  * bsp_display_start(), with its draw buffers in internal RAM instead of
  * PSRAM. From PSRAM, every flush borrows a 46 KB internal DMA bounce buffer,
  * which fails once speech, TTS and DeepSeek connections are all up ("Failed
@@ -211,7 +392,6 @@ static void round_area(lv_event_t *e)
  * runs short too. Two 24-row buffers (22 KB each), taken once at boot, avoid
  * that.
  */
-#define DRAW_ROWS 24
 static lv_display_t *display_start(void)
 {
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
@@ -219,7 +399,7 @@ static lv_display_t *display_start(void)
     esp_lcd_panel_handle_t panel;
     esp_lcd_panel_io_handle_t io;
     const bsp_display_config_t panel_cfg = {
-        .max_transfer_sz = BSP_LCD_H_RES * DRAW_ROWS * 2,
+        .max_transfer_sz = BSP_LCD_H_RES * BOUNCE_ROWS * 2,
     };
     if (bsp_display_new(&panel_cfg, &panel, &io) != ESP_OK) return NULL;
     s_panel = panel;
@@ -231,7 +411,7 @@ static lv_display_t *display_start(void)
             .rotation = ESP_LV_ADAPTER_ROTATE_0,
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
-            .buffer_height = DRAW_ROWS,
+            .buffer_height = 2,   /* unused: te_start() gives LVGL its own buffer */
             .use_psram = false,
             .require_double_buffer = true,
         },
@@ -240,6 +420,9 @@ static lv_display_t *display_start(void)
     lv_display_t *disp = esp_lv_adapter_register_display(&disp_cfg);
     if (!disp) return NULL;
     lv_display_add_event_cb(disp, round_area, LV_EVENT_INVALIDATE_AREA, NULL);
+    if (!te_start(disp, panel, io)) return NULL;
+    lv_display_add_event_cb(disp, on_refr, LV_EVENT_REFR_START, NULL);
+    lv_display_add_event_cb(disp, on_refr, LV_EVENT_REFR_READY, NULL);
 
     const bsp_display_cfg_t touch_cfg = {
         .touch_flags = {.mirror_x = 1, .mirror_y = 1},
@@ -269,6 +452,7 @@ void ui_start(void)
     prefs_apply();
     ui_home();
     lv_timer_create(sleep_timer, 500, NULL);
+    if (esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ui", &s_fast_lock) == ESP_OK) lv_timer_create(fast_timer, 30, NULL);
     ui_unlock();
 }
 

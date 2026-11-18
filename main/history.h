@@ -14,6 +14,7 @@ void history_add(const char *q, const char *a, const char *who);   /* who: child
 void history_divider(void);
 /* The last `max` entries, oldest first; q == NULL marks a divider. */
 void history_each(int max, void (*fn)(const char *q, const char *a, void *ctx), void *ctx);
+const char *history_each_who(void);   /* inside history_each's fn: who asked (child/dad/mom, or "") */
 
 /* Every saved line, oldest first, as stored (for the export over USB). */
 void history_dump(void (*line_fn)(const char *line));

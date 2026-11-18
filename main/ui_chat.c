@@ -302,7 +302,7 @@ static void talk(bool down)
             set_status("没设置密钥", C_RED);
             return;
         }
-        mic_pitch_begin();   /* who's speaking, from their pitch */
+        mic_voice_begin();   /* who's speaking, from their pitch and timbre */
         if (!asr_begin(on_asr)) {
             set_status("稍等一下再说", C_DIM);
             return;
@@ -316,7 +316,9 @@ static void talk(bool down)
         s_listening = false;
         s_mode = W_THINK;
         asr_end();
-        chat_set_speaker(voices_classify(mic_pitch_end()));
+        voice_sample_t vs;
+        mic_voice_end(&vs);
+        chat_set_speaker(voices_classify(&vs));
         set_status("识别中…", C_DIM);
     }
 }

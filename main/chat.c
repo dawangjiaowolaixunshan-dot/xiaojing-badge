@@ -38,6 +38,7 @@ static const char *FORMAT_RULES =
 
 typedef struct {
     char *q, *a;
+    voice_who_t who;   /* who asked q */
 } turn_t;
 
 static turn_t s_hist[HISTORY];
@@ -102,6 +103,27 @@ static char *utf8_clean(const char *s)
     return d;
 }
 
+static void add_msg(cJSON *msgs, const char *role, const char *content);
+
+/* A question with who asked it after it, as the prompt's 家人 rule says;
+ * past ones too, so "爸爸 asked, then the child" doesn't run together. */
+static void add_question(cJSON *msgs, const char *q, voice_who_t who)
+{
+    if (who == VOICE_UNKNOWN) {
+        add_msg(msgs, "user", q);
+        return;
+    }
+    size_t n = strlen(q) + 48;
+    char *t = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    if (!t) {
+        add_msg(msgs, "user", q);
+        return;
+    }
+    snprintf(t, n, "%s\n（说话的是：%s）", q, voices_name(who));
+    add_msg(msgs, "user", t);
+    free(t);
+}
+
 static void add_msg(cJSON *msgs, const char *role, const char *content)
 {
     char *clean = utf8_clean(content);
@@ -140,7 +162,7 @@ static char *build_body(void)
     }
     free(custom);
     for (int i = 0; i < s_nhist; i++) {
-        add_msg(msgs, "user", s_hist[i].q);
+        add_question(msgs, s_hist[i].q, s_hist[i].who);
         add_msg(msgs, "assistant", s_hist[i].a);
     }
     /* The model can't know the date; the badge's clock (from NTP) can. It
@@ -173,10 +195,10 @@ static char *build_body(void)
             free(recall);
         } else {
             free(recall);
-            add_msg(msgs, "user", s_question);
+            add_question(msgs, s_question, s_who);
         }
     } else {
-        add_msg(msgs, "user", s_question);
+        add_question(msgs, s_question, s_who);   /* no clock yet: still say who's asking */
     }
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -219,6 +241,7 @@ static void remember(void)
     }
     s_hist[s_nhist].q = psram_strdup(s_question, TURN_CAP);
     s_hist[s_nhist].a = psram_strdup(s_reply, REPLY_CAP);
+    s_hist[s_nhist].who = s_who;
     if (s_hist[s_nhist].q && s_hist[s_nhist].a) s_nhist++;
 }
 
@@ -239,7 +262,9 @@ static void restore_one(const char *q, const char *a, void *ctx)
     }
     strlcpy(s_question, q, TURN_CAP);
     strlcpy(s_reply, a, REPLY_CAP);
+    s_who = voices_from_key(history_each_who());
     remember();
+    s_who = VOICE_UNKNOWN;
 }
 
 void chat_restore(void)

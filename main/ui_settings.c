@@ -236,63 +236,91 @@ static void on_add_wifi(lv_event_t *e)
     if (!timer) timer = lv_timer_create(prov_timer, 500, NULL);
 }
 
-/* ---- 认识声音: each of the family says a line once ---- */
+/* ---- 认识声音: each of the family says three short lines ---- */
 
 static voice_who_t s_enroll_who;
-static lv_obj_t *s_enroll_lbl;
+static lv_obj_t *s_enroll_lbl, *s_enroll_line;
+
+static const char *enroll_line(voice_who_t who, int i)
+{
+    static const char *CHILD[] = {"小鲸你好，我是你的小主人", "今天我想背一首古诗", "三十七加四十八等于八十五"};
+    static const char *ADULT[] = {"小鲸你好，我是%s", "今天天气不错，我们出去走走", "给孩子讲一个有趣的故事吧"};
+    static char buf[80];
+    if (who == VOICE_CHILD) return CHILD[i % 3];
+    snprintf(buf, sizeof(buf), ADULT[i % 3], voices_name(who));
+    return buf;
+}
+
+static void show_enroll_line(void)
+{
+    int n = voices_enrolled_n(s_enroll_who);
+    char buf[160];
+    if (n >= VOICE_ENROLL_SENTENCES) {
+        snprintf(buf, sizeof(buf), "录好了！\n想再录一遍就退出重进");
+    } else {
+        snprintf(buf, sizeof(buf), "第 %d / %d 句，按住 PWR 读：\n“%s”", n + 1, VOICE_ENROLL_SENTENCES,
+                 enroll_line(s_enroll_who, n));
+    }
+    lv_label_set_text(s_enroll_line, buf);
+}
 
 static void no_sink(const int16_t *pcm, size_t n) {}
 
 static void enroll_talk(bool pressed)
 {
-    if (!s_enroll_lbl) return;
+    if (!s_enroll_lbl || voices_enrolled_n(s_enroll_who) >= VOICE_ENROLL_SENTENCES) return;
     if (pressed) {
-        mic_pitch_begin();
+        mic_voice_begin();
         mic_start(no_sink);
         lv_label_set_text(s_enroll_lbl, "正在听…说完松开");
         return;
     }
     mic_stop();
-    int hz = mic_pitch_end();
-    char buf[160];
-    if (!hz) {
-        snprintf(buf, sizeof(buf), "没听清，按住 PWR 再说一句长一点的话");
+    voice_sample_t vs;
+    char buf[200];
+    if (!mic_voice_end(&vs)) {
+        snprintf(buf, sizeof(buf), "没听清，再读一遍，声音大一点");
     } else {
-        voices_enroll(s_enroll_who, hz);
-        int n = snprintf(buf, sizeof(buf), "记住啦！%s的声音大约 %d Hz", voices_name(s_enroll_who), hz);
-        for (int i = 0; i < VOICE_COUNT; i++) {
-            int other = voices_enrolled_hz(i);
-            if (i == (int)s_enroll_who || !other) continue;
-            float r = (float)hz / other;
-            if (r > 0.88f && r < 1.14f) {   /* within two semitones or so */
-                n += snprintf(buf + n, sizeof(buf) - n, "\n和%s（%d Hz）很接近，可能会分不清", voices_name(i), other);
+        voices_enroll(s_enroll_who, &vs);
+        int n = snprintf(buf, sizeof(buf), "记住了这一句（%d Hz）", vs.hz);
+        if (voices_enrolled_n(s_enroll_who) >= VOICE_ENROLL_SENTENCES) {
+            /* How far the others' voices are from this one, now it's complete. */
+            for (int i = 0; i < VOICE_COUNT; i++) {
+                if (i == (int)s_enroll_who || !voices_enrolled_n(i)) continue;
+                float sc = voices_score(i, &vs);
+                if (sc < VP_UNKNOWN) n += snprintf(buf + n, sizeof(buf) - n, "\n和%s的声音有点像，可能偶尔认错", voices_name(i));
             }
         }
     }
     lv_label_set_text(s_enroll_lbl, buf);
+    show_enroll_line();
 }
 
-static void enroll_back(void) { s_enroll_lbl = NULL; ui_settings(); }
+static void enroll_back(void) { s_enroll_lbl = s_enroll_line = NULL; ui_settings(); }
 
 static void open_enroll(voice_who_t who)
 {
     s_enroll_who = who;
+    voices_reset(who);   /* a fresh recording each time */
     lv_obj_t *scr = ui_screen();
     ui_back_button(scr);
     char buf[160];
     snprintf(buf, sizeof(buf), "录入%s的声音", voices_name(who));
     lv_obj_t *t = ui_label(scr, &g_font_text, C_ACCENT, buf);
     lv_obj_align(t, LV_ALIGN_CENTER, 0, -150);
-    snprintf(buf, sizeof(buf), "请%s按住侧面的 PWR 键，\n说一句话，比如\n“小鲸你好，我是%s”，\n说完松开。",
-             who == VOICE_CHILD ? "孩子" : who == VOICE_DAD ? "爸爸" : "妈妈", who == VOICE_CHILD ? "小主人" : voices_name(who));
-    lv_obj_t *h = ui_label(scr, &g_font_text, C_TEXT, buf);
-    lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(h, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_t *h = ui_label(scr, &g_font_text, C_DIM, "离吧唧一手远，正常说话的音量");
+    lv_obj_align(h, LV_ALIGN_CENTER, 0, -112);
+    s_enroll_line = ui_label(scr, &g_font_text, C_TEXT, "");
+    lv_obj_set_width(s_enroll_line, 340);
+    lv_label_set_long_mode(s_enroll_line, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_align(s_enroll_line, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_enroll_line, LV_ALIGN_CENTER, 0, -40);
     s_enroll_lbl = ui_label(scr, &g_font_text, C_GREEN, "");
     lv_obj_set_width(s_enroll_lbl, 320);
     lv_label_set_long_mode(s_enroll_lbl, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_align(s_enroll_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_enroll_lbl, LV_ALIGN_CENTER, 0, 100);
+    lv_obj_align(s_enroll_lbl, LV_ALIGN_CENTER, 0, 80);
+    show_enroll_line();
     ui_show(scr, enroll_back, enroll_talk);
 }
 
@@ -372,12 +400,14 @@ void ui_settings(void)
     pill(PREFS_VOICE_NAMES[g_prefs.poem_voice], C_ACCENT, on_poem_voice, NULL);
 
     card("认识声音");
-    row_title("每人按住 PWR 说一句，小鲸就分得清谁在说话");
+    row_title("每人读三句，小鲸就分得清谁在说话");
     for (int i = 0; i < VOICE_COUNT; i++) {
-        int hz = voices_enrolled_hz(i);
-        if (hz) snprintf(buf, sizeof(buf), "%s  已录（%d Hz）", voices_name(i), hz);
+        int n = voices_enrolled_n(i);
+        bool done = n >= VOICE_ENROLL_SENTENCES;
+        if (done) snprintf(buf, sizeof(buf), "%s  已录（点一下重录）", voices_name(i));
+        else if (voices_enrolled_hz(i)) snprintf(buf, sizeof(buf), "%s  要重录（新版更准）", voices_name(i));
         else snprintf(buf, sizeof(buf), "录入%s的声音", voices_name(i));
-        pill_ud(buf, hz ? C_PANEL : 0x2f5bea, on_enroll, (void *)(intptr_t)i);
+        pill_ud(buf, done ? C_PANEL : 0x2f5bea, on_enroll, (void *)(intptr_t)i);
     }
 
     card("省电");

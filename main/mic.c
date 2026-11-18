@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mfcc.h"
 
 static const char *TAG = "mic";
 #define BLOCK 320           /* 20 ms */
@@ -22,48 +23,26 @@ static volatile mic_sink_t s_sink;
 static volatile int s_level;
 static TaskHandle_t s_task;
 
-/* Pitch while someone talks: one estimate per 20 ms block (over the last
- * 40 ms), kept while voiced; the median at the end tells voices apart. */
+/* Who's talking: for each voiced 20 ms block, its pitch and the timbre
+ * (MFCC) of the last 32 ms; the median pitch and mean timbre at the end. */
 #define PITCH_MAX 600
-static volatile bool s_pitch_on;
+static volatile bool s_voice_on;
 static uint16_t *s_pitches;
 static volatile int s_npitch;
+static vp_acc_t s_acc;
 static int16_t s_prev[BLOCK];
+static int16_t s_win[MFCC_N];
 
-static void pitch_block(const int16_t *cur)
+static void voice_block(const int16_t *cur)
 {
-    /* Down to 8 kHz first (pairs averaged): pitch needs no more, and the
-     * autocorrelation costs a quarter. */
-    enum { N = BLOCK, RATE = MIC_RATE / 2, LMIN = RATE / 450, LMAX = RATE / 70 };
-    static float x[N];
-    float e = 0;
-    for (int j = 0; j < N; j++) {
-        int i = 2 * j;
-        float v = i < BLOCK ? 0.5f * (s_prev[i] + s_prev[i + 1]) : 0.5f * (cur[i - BLOCK] + cur[i - BLOCK + 1]);
-        x[j] = v;
-        e += v * v;
-    }
-    if (e < N * 200.0f * 200.0f) return;   /* too quiet to be speech */
-    static float r[LMAX + 1];
-    float best = 0;
-    int lag = 0;
-    for (int l = LMIN; l <= LMAX; l++) {
-        float xy = 0, xx = 0, yy = 0;
-        for (int i = 0; i + l < N; i++) {
-            xy += x[i] * x[i + l];
-            xx += x[i] * x[i];
-            yy += x[i + l] * x[i + l];
-        }
-        r[l] = xx > 0 && yy > 0 ? xy / sqrtf(xx * yy) : 0;
-        if (r[l] > best) {
-            best = r[l];
-            lag = l;
-        }
-    }
-    if (best < 0.6f || !lag) return;   /* not voiced */
-    /* A peak at twice the period looks as good; prefer the shorter one. */
-    if (lag / 2 >= LMIN && r[lag / 2] > 0.85f * best) lag /= 2;
-    if (s_npitch < PITCH_MAX) s_pitches[s_npitch++] = (uint16_t)(RATE / lag);
+    int hz = vp_pitch(s_prev, cur);
+    if (!hz) return;
+    if (s_npitch < PITCH_MAX) s_pitches[s_npitch++] = (uint16_t)hz;
+    memcpy(s_win, s_prev + 2 * BLOCK - MFCC_N, (MFCC_N - BLOCK) * sizeof(int16_t));
+    memcpy(s_win + MFCC_N - BLOCK, cur, BLOCK * sizeof(int16_t));
+    float c[MFCC_DIMS];
+    mfcc_frame(s_win, c);
+    vp_acc_add(&s_acc, c);
 }
 
 static void mic_task(void *arg)
@@ -88,7 +67,7 @@ static void mic_task(void *arg)
         float rms = sqrtf((float)sq / BLOCK);
         int lvl = rms < 30 ? 0 : (int)(20.0f * log10f(rms / 30.0f) * 2.5f);
         s_level = lvl > 100 ? 100 : lvl;
-        if (s_pitch_on && s_pitches) pitch_block(mono);
+        if (s_voice_on && s_pitches) voice_block(mono);
         memcpy(s_prev, mono, sizeof(s_prev));
         mic_sink_t sink = s_sink;
         if (sink) sink(mono, BLOCK);
@@ -151,21 +130,26 @@ int mic_level(void) { return s_level; }
 
 esp_codec_dev_handle_t mic_speaker(void) { return s_spk; }
 
-void mic_pitch_begin(void)
+void mic_voice_begin(void)
 {
     if (!s_pitches) s_pitches = heap_caps_malloc(PITCH_MAX * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     s_npitch = 0;
-    s_pitch_on = true;
+    memset(&s_acc, 0, sizeof(s_acc));
+    s_voice_on = true;
 }
 
 static int cmp_u16(const void *a, const void *b) { return *(const uint16_t *)a - *(const uint16_t *)b; }
 
-int mic_pitch_end(void)
+bool mic_voice_end(voice_sample_t *out)
 {
-    s_pitch_on = false;
-    int n = s_npitch;
-    if (!s_pitches || n < 10) return 0;   /* under 0.2 s of voice: can't tell */
-    qsort(s_pitches, n, sizeof(uint16_t), cmp_u16);
-    ESP_LOGI(TAG, "pitch: median %d Hz over %d voiced blocks", s_pitches[n / 2], n);
-    return s_pitches[n / 2];
+    s_voice_on = false;
+    vTaskDelay(pdMS_TO_TICKS(25));   /* let a block in progress finish */
+    int n = s_npitch, hz = 0;
+    if (s_pitches && n >= 10) {   /* under 0.2 s of voice: no pitch */
+        qsort(s_pitches, n, sizeof(uint16_t), cmp_u16);
+        hz = s_pitches[n / 2];
+    }
+    bool ok = vp_acc_done(&s_acc, hz, out);
+    ESP_LOGI(TAG, "voice: %d Hz over %d voiced blocks%s", hz, out->frames, ok ? "" : " (too little)");
+    return ok;
 }

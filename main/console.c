@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
+#include "esp_timer.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_heap_caps.h"
@@ -19,9 +21,13 @@
 #include "tts.h"
 #include "settings.h"
 #include "ui.h"
+#include "voices.h"
+#include "mic.h"
 
 static const char *TAG = "console";
 #define CMD_LINE_MAX 512
+
+static void vp_sink(const int16_t *pcm, size_t n) {}
 
 static void wipe(char *s, size_t n)
 {
@@ -146,6 +152,46 @@ static void handle(char *line)
     } else if (!strncmp(line, "ask=", 4)) {   /* a typed question, as if spoken */
         ui_chat_inject(line + 4);
         printf("@ok ask\n");
+    } else if (!strncmp(line, "vp=", 3)) {   /* "vp=<secs>" hears and names who; "vp=<secs>,child|dad|mom" enrolls a sentence */
+                int secs = atoi(line + 3);
+        const char *who_s = strchr(line, ',');
+        voice_who_t who = !who_s ? VOICE_UNKNOWN : !strcmp(who_s + 1, "child") ? VOICE_CHILD :
+                          !strcmp(who_s + 1, "dad") ? VOICE_DAD : !strcmp(who_s + 1, "mom") ? VOICE_MOM : VOICE_UNKNOWN;
+        if (who_s && who == VOICE_UNKNOWN) { printf("@fail vp who\n"); return; }
+        mic_voice_begin();
+        mic_start(vp_sink);
+        vTaskDelay(pdMS_TO_TICKS(1000 * (secs > 0 && secs < 10 ? secs : 3)));
+        mic_stop();
+        voice_sample_t vs;
+        bool ok = mic_voice_end(&vs);
+        if (!ok) printf("@vp short %d Hz %d blocks\n", vs.hz, vs.frames);
+        else if (who != VOICE_UNKNOWN) { voices_enroll(who, &vs); printf("@vp enrolled %s n=%d %d Hz\n", voices_key(who), voices_enrolled_n(who), vs.hz); }
+        else { voice_who_t got = voices_classify(&vs); printf("@vp heard %s %d Hz\n", got == VOICE_UNKNOWN ? "unknown" : voices_key(got), vs.hz); }
+    } else if (!strncmp(line, "vpreset=", 8)) {
+        for (int i = 0; i < VOICE_COUNT; i++) if (!strcmp(line + 8, voices_key(i))) voices_reset(i);
+        printf("@ok vpreset\n");
+    } else if (!strcmp(line, "scrolltest")) {   /* the home dock swiped both ways; frame times while it moves */
+        for (int i = 0; i < 2; i++) {
+            ui_lock();
+            ui_frames_reset();
+            ui_home_scroll_test();
+            ui_unlock();
+            vTaskDelay(pdMS_TO_TICKS(700));
+            int n, avg, mx;
+            ui_frames_get(&n, &avg, &mx);
+            printf("@scroll %d frames, avg %d ms, max %d ms\n", n, avg / 1000, mx / 1000);
+        }
+    } else if (!strcmp(line, "voicelog")) {   /* /hist/voice.csv as "@v <line>", for tuning the voice ID */
+        FILE *f = fopen("/hist/voice.csv", "r");
+        char row[256];
+        int n = 0;
+        while (f && fgets(row, sizeof(row), f)) {
+            row[strcspn(row, "\n")] = 0;
+            printf("@v %s\n", row);
+            if (++n % 20 == 0) vTaskDelay(1);
+        }
+        if (f) fclose(f);
+        printf("@v_end %d\n", n);
     } else if (!strcmp(line, "hist_dump")) {   /* one "@h <base64 line>" each, then "@h_end" */
         s_dump_n = 0;
         history_dump(dump_line);

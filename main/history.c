@@ -128,6 +128,9 @@ void history_divider(void)
     xSemaphoreGive(s_mu);
 }
 
+static const char *s_each_who = "";
+const char *history_each_who(void) { return s_each_who; }
+
 void history_each(int max, void (*fn)(const char *q, const char *a, void *ctx), void *ctx)
 {
     if (!s_ok) return;
@@ -142,8 +145,11 @@ void history_each(int max, void (*fn)(const char *q, const char *a, void *ctx), 
             if (!o) continue;
             const char *q = cJSON_GetStringValue(cJSON_GetObjectItem(o, "q"));
             const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(o, "a"));
+            const char *who = cJSON_GetStringValue(cJSON_GetObjectItem(o, "s"));
+            s_each_who = who ? who : "";
             if (cJSON_GetObjectItem(o, "new")) fn(NULL, NULL, ctx);
             else if (q && a) fn(q, a, ctx);
+            s_each_who = "";
             cJSON_Delete(o);
         }
     }

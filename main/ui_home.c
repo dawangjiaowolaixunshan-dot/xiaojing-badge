@@ -4,6 +4,7 @@
  * (DeepSeek), 古诗, 设置. Tap her to talk too.
  */
 #include <math.h>
+#include <string.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -13,11 +14,14 @@
 #include "pet.h"
 #include "pmu.h"
 #include "ui.h"
+#include "esp_heap_caps.h"
 #include "weather.h"
 
 LV_IMAGE_DECLARE(whale_img);
 
-static lv_obj_t *s_scr, *s_clock, *s_date, *s_arc, *s_whale, *s_dots[7];
+static lv_obj_t *s_apps[8], *s_dock;   /* the dock and its app buttons */
+static int s_napps;
+static lv_obj_t *s_scr, *s_clock, *s_date, *s_whale, *s_dots[7];
 static uint32_t s_next_extra;
 
 static void update_dots(void)
@@ -26,6 +30,106 @@ static void update_dots(void)
     for (int i = 0; i < 7; i++) {
         bool on = week >> (6 - i) & 1;   /* oldest on the left, today on the right */
         lv_obj_set_style_bg_opa(s_dots[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
+
+/*
+ * The battery ring, drawn once into small pictures that hug it (12 bands of
+ * rows, a left and a right piece each) and redrawn only when the level
+ * changes. As one lv_arc, or one 458 px picture, it cost 30-50 ms of every
+ * frame of a dock swipe; tiles are drawn only where the swipe touches them.
+ */
+#define RING_D 458
+#define RING_W 5
+#define RING_BANDS 12
+#define RING_TILES (RING_BANDS * 2)
+typedef struct {
+    lv_image_dsc_t dsc;
+    int x0, y0;   /* in the ring's 458 px square */
+} ring_tile_t;
+static ring_tile_t s_tiles[RING_TILES];
+static lv_obj_t *s_tile_obj[RING_TILES];
+static int s_ring_pct = -2;
+static uint32_t s_ring_col;
+
+static void ring_tiles_make(void)
+{
+    if (s_tiles[0].dsc.data) return;
+    const float c = (RING_D - 1) * 0.5f, ro = RING_D * 0.5f, ri = ro - RING_W - 1;
+    for (int band = 0; band < RING_BANDS; band++) {
+        int y0 = band * RING_D / RING_BANDS, y1 = (band + 1) * RING_D / RING_BANDS;
+        int lo = RING_D, hi = 0;   /* the left piece's columns: from the outer edge in to the inner one */
+        for (int y = y0; y < y1; y++) {
+            float dy = y - c, xo2 = ro * ro - dy * dy, xi2 = ri * ri - dy * dy;
+            if (xo2 < 0) continue;
+            int xa = (int)(c - sqrtf(xo2)) - 1, xb = xi2 > 0 ? (int)(c - sqrtf(xi2)) + 2 : (int)c + 1;
+            if (xa < lo) lo = xa;
+            if (xb > hi) hi = xb;
+        }
+        if (lo < 0) lo = 0;
+        if (hi > RING_D / 2) hi = RING_D / 2;
+        for (int side = 0; side < 2; side++) {
+            ring_tile_t *t = &s_tiles[band * 2 + side];
+            int w = hi - lo, h = y1 - y0;
+            t->x0 = side ? RING_D - hi : lo;
+            t->y0 = y0;
+            uint8_t *buf = heap_caps_calloc(1, w * h * 3, MALLOC_CAP_SPIRAM);
+            if (!buf) return;
+            t->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            t->dsc.header.cf = LV_COLOR_FORMAT_RGB565A8;
+            t->dsc.header.w = w;
+            t->dsc.header.h = h;
+            t->dsc.header.stride = w * 2;
+            t->dsc.data = buf;
+            t->dsc.data_size = w * h * 3;
+        }
+    }
+}
+
+static void ring_draw(int pct, uint32_t col)
+{
+    ring_tiles_make();
+    if (!s_tiles[RING_TILES - 1].dsc.data || (pct == s_ring_pct && col == s_ring_col)) return;
+    s_ring_pct = pct;
+    s_ring_col = col;
+    const float c = (RING_D - 1) * 0.5f, ro = RING_D * 0.5f, ri = ro - RING_W;
+    uint16_t on = lv_color_to_u16(lv_color_hex(col)), off = lv_color_to_u16(lv_color_hex(0x2a2a32));
+    float lit = (pct < 0 ? 100 : pct) * 3.6f;   /* degrees, clockwise from the top */
+    for (int k = 0; k < RING_TILES; k++) {
+        ring_tile_t *t = &s_tiles[k];
+        int w = t->dsc.header.w, h = t->dsc.header.h;
+        uint16_t *rgb = (uint16_t *)t->dsc.data;
+        uint8_t *alpha = (uint8_t *)t->dsc.data + w * h * 2;
+        for (int j = 0; j < h; j++) {
+            float dy = t->y0 + j - c;
+            for (int i = 0; i < w; i++) {
+                float dx = t->x0 + i - c, d = sqrtf(dx * dx + dy * dy);
+                float a = ro - d + 0.5f, b = d - ri + 0.5f;
+                a = a < 0 ? 0 : a > 1 ? 1 : a;
+                b = b < 0 ? 0 : b > 1 ? 1 : b;
+                alpha[j * w + i] = (uint8_t)(255 * a * b);
+                float ang = atan2f(dx, -dy) * 57.29578f;   /* 0 at the top, clockwise */
+                if (ang < 0) ang += 360;
+                rgb[j * w + i] = ang <= lit ? on : off;
+            }
+        }
+        if (s_tile_obj[k]) lv_obj_invalidate(s_tile_obj[k]);
+    }
+}
+
+static void ring_create(lv_obj_t *scr)
+{
+    ring_tiles_make();
+    s_ring_pct = -2;   /* drawn on the first update */
+    int off = (466 - RING_D) / 2;
+    for (int k = 0; k < RING_TILES; k++) {
+        s_tile_obj[k] = NULL;
+        if (!s_tiles[k].dsc.data) continue;
+        lv_obj_t *im = lv_image_create(scr);
+        lv_image_set_src(im, &s_tiles[k].dsc);
+        lv_obj_set_pos(im, off + s_tiles[k].x0, off + s_tiles[k].y0);
+        lv_obj_remove_flag(im, LV_OBJ_FLAG_CLICKABLE);
+        s_tile_obj[k] = im;
     }
 }
 
@@ -57,9 +161,8 @@ static void update_status(void)
     }
     lv_label_set_text(s_date, buf);
     update_dots();
-    lv_arc_set_value(s_arc, pct >= 0 ? pct : 100);
     uint32_t col = pct < 0 || charging ? 0x4fc48c : pct < 15 ? 0xd9534f : pct < 30 ? 0xe0a045 : 0x4fc48c;
-    lv_obj_set_style_arc_color(s_arc, lv_color_hex(col), LV_PART_INDICATOR);
+    ring_draw(pct, col);
 }
 
 static void home_timer(lv_timer_t *t)
@@ -93,6 +196,8 @@ static void home_timer(lv_timer_t *t)
 
 static void on_whale_tap(lv_event_t *e)
 {
+    lv_indev_t *in = lv_indev_active();
+    if (in && lv_indev_get_gesture_dir(in) != LV_DIR_NONE) return;   /* a swipe that began on her, not a tap */
     static const pet_clip_t TAP[] = {PET_WAVE, PET_JOY, PET_SHY, PET_GIGGLE};
     pet_play(s_whale, TAP[esp_random() % 4], false);
     s_next_extra = lv_tick_get() + 9000;
@@ -107,7 +212,9 @@ static void go_math(lv_event_t *e) { ui_math(); }
 
 static void on_delete(lv_event_t *e)
 {
-    if (lv_event_get_target(e) == s_scr) s_scr = NULL;   /* not a newer home made before this one went */
+    if (lv_event_get_target(e) != s_scr) return;   /* not a newer home made before this one went */
+    s_scr = s_dock = NULL;
+    memset(s_tile_obj, 0, sizeof(s_tile_obj));
 }
 
 /* A round app button with a label under it, on a page of the dock. */
@@ -118,13 +225,16 @@ static lv_obj_t *app(lv_obj_t *pg, int x, uint32_t color, const char *label, lv_
     lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x666666), LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(b, 24, 0);
-    lv_obj_set_style_shadow_color(b, lv_color_hex(color), 0);
-    lv_obj_set_style_shadow_opa(b, LV_OPA_60, 0);
+    /* A light rim, not a glow: a 24 px shadow on each button doubled the cost of every swipe frame. */
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_border_width(b, 2, 0);
+    lv_obj_set_style_border_color(b, lv_color_lighten(lv_color_hex(color), LV_OPA_50), 0);
+    lv_obj_set_style_border_opa(b, LV_OPA_70, 0);
     lv_obj_set_style_pad_all(b, 0, 0);
     lv_obj_align(b, LV_ALIGN_CENTER, x, -16);
     lv_obj_add_flag(b, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);   /* a swipe that starts on a button still turns the page */
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    if (s_napps < 8) s_apps[s_napps++] = b;
     lv_obj_t *l = ui_label(pg, &g_font_text, 0xb8c2d8, label);
     lv_obj_align(l, LV_ALIGN_CENTER, x, 30);
     return b;
@@ -142,10 +252,28 @@ static lv_obj_t *page(lv_obj_t *dock)
 
 static lv_obj_t *s_page_dots[2];
 
+
+void ui_home_scroll_test(void)
+{
+    if (!s_scr || !s_dock) return;
+    int x = lv_obj_get_scroll_x(s_dock) > 233 ? 0 : 466;
+    lv_obj_scroll_to_x(s_dock, x, LV_ANIM_ON);
+}
+
 static void show_page_dot(int page)
 {
     for (int i = 0; i < 2; i++)
         lv_obj_set_style_bg_color(s_page_dots[i], lv_color_hex(i == page ? 0xe0e6f0 : 0x3a4256), 0);
+}
+
+/* A sideways swipe anywhere on the home screen (on her, the clock, the dots) turns the dock's page. */
+static void on_gesture(lv_event_t *e)
+{
+    lv_indev_t *in = lv_indev_active();
+    if (!in || !s_dock) return;
+    lv_dir_t d = lv_indev_get_gesture_dir(in);
+    if (d == LV_DIR_LEFT) lv_obj_scroll_to_x(s_dock, 466, LV_ANIM_ON);
+    else if (d == LV_DIR_RIGHT) lv_obj_scroll_to_x(s_dock, 0, LV_ANIM_ON);
 }
 
 static void on_dock_scroll(lv_event_t *e)
@@ -158,17 +286,7 @@ void ui_home(void)
 {
     lv_obj_t *scr = ui_screen();
 
-    s_arc = lv_arc_create(scr);
-    lv_obj_set_size(s_arc, 458, 458);
-    lv_obj_center(s_arc);
-    lv_arc_set_rotation(s_arc, 270);
-    lv_arc_set_bg_angles(s_arc, 0, 360);
-    lv_arc_set_range(s_arc, 0, 100);
-    lv_obj_remove_style(s_arc, NULL, LV_PART_KNOB);
-    lv_obj_remove_flag(s_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(s_arc, 5, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_arc, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(s_arc, lv_color_hex(0x2a2a32), LV_PART_MAIN);
+    ring_create(scr);
 
     s_clock = ui_label(scr, &g_font_clock, C_TEXT, "--:--");
     lv_obj_align(s_clock, LV_ALIGN_CENTER, 0, -176);
@@ -176,7 +294,7 @@ void ui_home(void)
     lv_obj_align(s_date, LV_ALIGN_CENTER, 0, -130);
 
     s_whale = pet_create(scr);
-    lv_image_set_scale(s_whale, 270);   /* 156 px at 105%: she's the home screen */
+    /* 156 px as drawn: at 105% she was rescaled on every frame, which slowed the whole screen */
     lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -26);
 
     /* The week's check-ins under her: a lit dot for each day with learning. */
@@ -207,12 +325,14 @@ void ui_home(void)
     lv_obj_add_flag(dock, LV_OBJ_FLAG_SCROLL_ONE);
     lv_obj_set_scrollbar_mode(dock, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(dock, on_dock_scroll, LV_EVENT_SCROLL_END, NULL);
+    s_napps = 0;
     lv_obj_t *p1 = page(dock), *p2 = page(dock);
+    s_dock = dock;
 
-    lv_obj_t *b = app(p1, -138, 0x2f5bea, "小鲸", go_chat);
+    lv_obj_t *b = app(p1, -138, 0xffd6e0, "小鲸", go_chat);   /* light pink: her blue hair vanished on blue */
     lv_obj_t *icon = lv_image_create(b);
     lv_image_set_src(icon, &whale_img);
-    lv_image_set_scale(icon, 110);   /* 136 px at 43%: 58 px */
+    /* her face at 58 px (tools/make_icon.py): no scaling, which slowed swipes */
     lv_obj_center(icon);
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
     b = app(p1, -46, 0xd9823c, "古诗", go_poem);
@@ -237,6 +357,7 @@ void ui_home(void)
     show_page_dot(0);
 
     lv_obj_add_event_cb(scr, on_delete, LV_EVENT_DELETE, NULL);
+    lv_obj_add_event_cb(scr, on_gesture, LV_EVENT_GESTURE, NULL);
     s_scr = scr;
     s_next_extra = lv_tick_get() + 8000;
     update_status();
