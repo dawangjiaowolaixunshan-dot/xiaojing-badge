@@ -43,6 +43,9 @@ void ui_recite(void);
 void ui_wifi_add(void);
 void ui_words(void);
 void ui_words_inject(const char *heard);
+void ui_math(void);
+void ui_math_inject(const char *heard);
+int ui_math_answer(void);
 void ui_recite_inject(const char *heard);
 bool ui_chat_listening(void);
 extern lv_font_t g_font_clock;   /* 60 px bold digits for the home clock */

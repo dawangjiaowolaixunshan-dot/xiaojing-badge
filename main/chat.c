@@ -63,12 +63,53 @@ static char *psram_strdup(const char *s, size_t cap)
     return d;
 }
 
+/* A copy of s with anything that isn't valid UTF-8 dropped. One bad byte
+ * (a cut in the middle of a character, in this request or in an old chat
+ * that's recalled) and DeepSeek refuses the whole request with a 400. */
+static char *utf8_clean(const char *s)
+{
+    size_t n = strlen(s);
+    char *d = heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (!d) return NULL;
+    const unsigned char *p = (const unsigned char *)s;
+    size_t o = 0;
+    while (*p) {
+        unsigned c = *p;
+        int len = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        bool ok = len > 0;
+        for (int i = 1; ok && i < len; i++) ok = (p[i] & 0xC0) == 0x80;
+        if (ok && len == 3) {
+            unsigned cp = (c & 0x0F) << 12 | (p[1] & 0x3F) << 6 | (p[2] & 0x3F);
+            ok = cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF);   /* no overlongs, no surrogates */
+        } else if (ok && len == 4) {
+            unsigned cp = (c & 0x07) << 18 | (p[1] & 0x3F) << 12 | (p[2] & 0x3F) << 6 | (p[3] & 0x3F);
+            ok = cp >= 0x10000 && cp <= 0x10FFFF;
+        }
+        if (!ok) {
+            p++;   /* skip the bad byte */
+            continue;
+        }
+        if (len == 1 && c < 0x20 && c != '\n' && c != '\t') {   /* stray control bytes too */
+            p++;
+            continue;
+        }
+        memcpy(d + o, p, len);
+        o += len;
+        p += len;
+    }
+    d[o] = '\0';
+    if (o != n) ESP_LOGW(TAG, "dropped %d bad bytes from a message", (int)(n - o));
+    return d;
+}
+
 static void add_msg(cJSON *msgs, const char *role, const char *content)
 {
+    char *clean = utf8_clean(content);
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "role", role);
-    cJSON_AddStringToObject(m, "content", content);
+    cJSON_AddStringToObject(m, "content", clean ? clean : "");
     cJSON_AddItemToArray(msgs, m);
+    free(clean);
 }
 
 static char *build_body(void)
@@ -116,7 +157,7 @@ static char *build_body(void)
          * so "the whale you told me about" still finds the whale. */
         char *recall = heap_caps_malloc(1600, MALLOC_CAP_SPIRAM);
         if (recall) history_recall(s_question, s_nhist, recall, 1600);
-        size_t qn = strlen(s_question) + 256 + (recall ? strlen(recall) + 64 : 0);
+        size_t qn = strlen(s_question) + 640 + (recall ? strlen(recall) + 256 : 0);   /* the Chinese wrapping alone is ~100 bytes each; too small and the last "）" is cut in half (400) */
         char *q = heap_caps_malloc(qn, MALLOC_CAP_SPIRAM);
         if (q) {
             int at = snprintf(q, qn, "%s\n（背景信息，只在问到时间、日期、天气、穿衣或出门时才用，平时不要提：%s%s%s现在是北京时间 %d年%d月%d日 星期%s %02d:%02d%s%s）", s_question,

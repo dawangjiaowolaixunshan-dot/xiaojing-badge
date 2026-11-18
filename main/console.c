@@ -158,6 +158,7 @@ static void handle(char *line)
         else if (!strcmp(line + 7, "recite")) ui_recite();
         else if (!strcmp(line + 7, "wifiadd")) ui_wifi_add();
         else if (!strcmp(line + 7, "words")) ui_words();
+        else if (!strcmp(line + 7, "math")) ui_math();
         else ui_home();
         ui_unlock();
         printf("@ok screen\n");
@@ -202,6 +203,13 @@ static void handle(char *line)
         }
         printf("@shot_end\n");
         lv_draw_buf_destroy(snap);
+    } else if (!strncmp(line, "math=", 5)) {   /* as if said aloud; "math=!" says the right answer */
+        ui_lock();
+        char buf[16];
+        if (!strcmp(line + 5, "!")) snprintf(buf, sizeof(buf), "%d", ui_math_answer());
+        ui_math_inject(!strcmp(line + 5, "!") ? buf : line + 5);
+        ui_unlock();
+        printf("@ok math\n");
     } else if (!strncmp(line, "word=", 5)) {   /* as if read aloud */
         ui_lock();
         ui_words_inject(line + 5);

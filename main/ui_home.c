@@ -103,6 +103,7 @@ static void go_poem(lv_event_t *e) { ui_poem_home(); }
 static void go_settings(lv_event_t *e) { ui_settings(); }
 static void go_recite(lv_event_t *e) { ui_recite(); }
 static void go_words(lv_event_t *e) { ui_words(); }
+static void go_math(lv_event_t *e) { ui_math(); }
 
 static void on_delete(lv_event_t *e)
 {
@@ -220,7 +221,9 @@ void ui_home(void)
     lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "背"));
     b = app(p1, 138, 0x8a5cf6, "单词", go_words);
     lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, "Aa"));
-    b = app(p2, -138, 0x3a4256, "设置", go_settings);
+    b = app(p2, -138, 0xe0563b, "口算", go_math);
+    lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "算"));
+    b = app(p2, -46, 0x3a4256, "设置", go_settings);
     lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, LV_SYMBOL_SETTINGS));
 
     for (int i = 0; i < 2; i++) {

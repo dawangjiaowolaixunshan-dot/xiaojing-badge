@@ -278,6 +278,20 @@ static int pairs_of(const char *text, char pairs[][7])
     return n;
 }
 
+/* How many bytes of s, at most max, end on a whole UTF-8 character. A cut in
+ * the middle of one makes the request invalid JSON (DeepSeek answers 400). */
+static int utf8_prefix(const char *s, int max)
+{
+    int n = 0;
+    while (s[n]) {
+        unsigned char c = (unsigned char)s[n];
+        int len = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        if (n + len > max) break;
+        n += len;
+    }
+    return n;
+}
+
 size_t history_recall(const char *question, int skip_newest, char *out, size_t cap)
 {
     out[0] = '\0';
@@ -310,7 +324,8 @@ size_t history_recall(const char *question, int skip_newest, char *out, size_t c
     for (int r = 0; r < 3; r++) {
         if (best[r] < 0 || best_s[r] < 3) continue;   /* a real overlap, not one shared word */
         const mem_t *m = &s_mem[(s_mem_head + best[r]) % MEM_MAX];
-        int w = snprintf(out + n, cap - n, "问：%.120s 答：%.300s\n", m->q, m->a);
+        int w = snprintf(out + n, cap - n, "问：%.*s 答：%.*s\n",
+                         utf8_prefix(m->q, 120), m->q, utf8_prefix(m->a, 300), m->a);
         if (w < 0 || (size_t)w >= cap - n) break;
         n += w;
     }
