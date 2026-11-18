@@ -20,8 +20,10 @@
 #include "settings.h"
 #include "tts.h"
 #include "ui.h"
+#include "care.h"
 #include "power.h"
 #include "voices.h"
+#include "words.h"
 #include "weather.h"
 
 static const char *TAG = "app";
@@ -111,6 +113,8 @@ void app_main(void)
     chat_restore();
     history_recall_init();
     voices_init();
+    care_init();
+    words_init();
     ui_start();
     pmu_init();
     console_start();

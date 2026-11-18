@@ -35,6 +35,7 @@ static const char *TAG = "asr";
 static StreamBufferHandle_t s_audio;
 static EventGroupHandle_t s_ev;
 static asr_text_cb_t s_cb;
+static const char *s_langs = "\"zh\",\"en\"";   /* JSON array body for language_hints */
 static char s_task_id[33];
 static char *s_done, *s_text, *s_msg;   /* finished sentences, shown text, incoming message */
 static size_t s_msg_len;
@@ -101,8 +102,8 @@ static void send_json(esp_websocket_client_handle_t ws, const char *action, bool
                  "{\"header\":{\"action\":\"run-task\",\"task_id\":\"%s\",\"streaming\":\"duplex\"},"
                  "\"payload\":{\"task_group\":\"audio\",\"task\":\"asr\",\"function\":\"recognition\","
                  "\"model\":\"" MODEL "\",\"parameters\":{\"format\":\"pcm\",\"sample_rate\":%d,"
-                 "\"language_hints\":[\"zh\",\"en\"]},\"input\":{}}}",
-                 s_task_id, MIC_RATE);
+                 "\"language_hints\":[%s]},\"input\":{}}}",
+                 s_task_id, MIC_RATE, s_langs);
     } else {
         snprintf(msg, 768, "{\"header\":{\"action\":\"%s\",\"task_id\":\"%s\",\"streaming\":\"duplex\"},"
                  "\"payload\":{\"input\":{}}}", action, s_task_id);
@@ -187,8 +188,11 @@ done:
     vTaskDelete(NULL);
 }
 
-bool asr_begin(asr_text_cb_t cb)
+bool asr_begin(asr_text_cb_t cb) { return asr_begin_lang(cb, "\"zh\",\"en\""); }
+
+bool asr_begin_lang(asr_text_cb_t cb, const char *langs)
 {
+    s_langs = langs;
     if (!s_ev) {
         s_ev = xEventGroupCreate();
         xEventGroupSetBits(s_ev, EV_IDLE);

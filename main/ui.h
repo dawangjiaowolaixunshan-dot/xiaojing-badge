@@ -38,6 +38,12 @@ void ui_poem_home(void);
 void ui_chat(void);
 void ui_settings(void);
 void ui_poem_read(void);
+int ui_poem_current(void);   /* the poem last shown in 古诗, -1 if none */
+void ui_recite(void);
+void ui_wifi_add(void);
+void ui_words(void);
+void ui_words_inject(const char *heard);
+void ui_recite_inject(const char *heard);
 bool ui_chat_listening(void);
 extern lv_font_t g_font_clock;   /* 60 px bold digits for the home clock */
 void ui_chat_inject(const char *question);   /* as if heard (testing over USB) */

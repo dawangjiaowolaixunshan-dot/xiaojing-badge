@@ -9,6 +9,7 @@
 
 #include "esp_random.h"
 #include "net.h"
+#include "care.h"
 #include "pet.h"
 #include "pmu.h"
 #include "ui.h"
@@ -16,8 +17,17 @@
 
 LV_IMAGE_DECLARE(whale_img);
 
-static lv_obj_t *s_scr, *s_clock, *s_date, *s_arc, *s_whale;
+static lv_obj_t *s_scr, *s_clock, *s_date, *s_arc, *s_whale, *s_dots[7];
 static uint32_t s_next_extra;
+
+static void update_dots(void)
+{
+    uint8_t week = care_week();
+    for (int i = 0; i < 7; i++) {
+        bool on = week >> (6 - i) & 1;   /* oldest on the left, today on the right */
+        lv_obj_set_style_bg_opa(s_dots[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
 
 static void update_status(void)
 {
@@ -46,6 +56,7 @@ static void update_status(void)
         snprintf(buf, sizeof(buf), "%s%s", net_up() ? "对时中…" : "连接网络中…", batt);
     }
     lv_label_set_text(s_date, buf);
+    update_dots();
     lv_arc_set_value(s_arc, pct >= 0 ? pct : 100);
     uint32_t col = pct < 0 || charging ? 0x4fc48c : pct < 15 ? 0xd9534f : pct < 30 ? 0xe0a045 : 0x4fc48c;
     lv_obj_set_style_arc_color(s_arc, lv_color_hex(col), LV_PART_INDICATOR);
@@ -71,6 +82,7 @@ static void home_timer(lv_timer_t *t)
             bool late = net_time_valid() && (tm.tm_hour >= 21 || tm.tm_hour < 6);
             pet_clip_t c = late && esp_random() % 3 == 0 ? (esp_random() % 2 ? PET_YAWN : PET_SLEEP)
                                                           : EXTRA[esp_random() % (sizeof(EXTRA) / sizeof(EXTRA[0]))];
+            if (care_food() < 30 && esp_random() % 2) c = PET_HUNGRY;   /* she lets you know */
             pet_play(s_whale, c, false);
             s_next_extra = now + 9000 + esp_random() % 9000;
         } else {
@@ -89,16 +101,18 @@ static void on_whale_tap(lv_event_t *e)
 static void go_chat(lv_event_t *e) { ui_chat(); }
 static void go_poem(lv_event_t *e) { ui_poem_home(); }
 static void go_settings(lv_event_t *e) { ui_settings(); }
+static void go_recite(lv_event_t *e) { ui_recite(); }
+static void go_words(lv_event_t *e) { ui_words(); }
 
 static void on_delete(lv_event_t *e)
 {
     if (lv_event_get_target(e) == s_scr) s_scr = NULL;   /* not a newer home made before this one went */
 }
 
-/* A round app button with a label under it, on the dock. */
-static lv_obj_t *app(lv_obj_t *scr, int x, int y, uint32_t color, const char *label, lv_event_cb_t cb)
+/* A round app button with a label under it, on a page of the dock. */
+static lv_obj_t *app(lv_obj_t *pg, int x, uint32_t color, const char *label, lv_event_cb_t cb)
 {
-    lv_obj_t *b = lv_button_create(scr);
+    lv_obj_t *b = lv_button_create(pg);
     lv_obj_set_size(b, 62, 62);
     lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
@@ -107,11 +121,36 @@ static lv_obj_t *app(lv_obj_t *scr, int x, int y, uint32_t color, const char *la
     lv_obj_set_style_shadow_color(b, lv_color_hex(color), 0);
     lv_obj_set_style_shadow_opa(b, LV_OPA_60, 0);
     lv_obj_set_style_pad_all(b, 0, 0);
-    lv_obj_align(b, LV_ALIGN_CENTER, x, y);
+    lv_obj_align(b, LV_ALIGN_CENTER, x, -16);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);   /* a swipe that starts on a button still turns the page */
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *l = ui_label(scr, &g_font_text, 0xb8c2d8, label);
-    lv_obj_align(l, LV_ALIGN_CENTER, x, y + 46);
+    lv_obj_t *l = ui_label(pg, &g_font_text, 0xb8c2d8, label);
+    lv_obj_align(l, LV_ALIGN_CENTER, x, 30);
     return b;
+}
+
+static lv_obj_t *page(lv_obj_t *dock)
+{
+    lv_obj_t *pg = lv_obj_create(dock);
+    lv_obj_remove_style_all(pg);
+    lv_obj_set_size(pg, 466, 112);
+    lv_obj_add_flag(pg, LV_OBJ_FLAG_SNAPPABLE);
+    lv_obj_remove_flag(pg, LV_OBJ_FLAG_SCROLLABLE);
+    return pg;
+}
+
+static lv_obj_t *s_page_dots[2];
+
+static void show_page_dot(int page)
+{
+    for (int i = 0; i < 2; i++)
+        lv_obj_set_style_bg_color(s_page_dots[i], lv_color_hex(i == page ? 0xe0e6f0 : 0x3a4256), 0);
+}
+
+static void on_dock_scroll(lv_event_t *e)
+{
+    lv_obj_t *dock = lv_event_get_target(e);
+    show_page_dot(lv_obj_get_scroll_x(dock) > 233 ? 1 : 0);
 }
 
 void ui_home(void)
@@ -136,27 +175,63 @@ void ui_home(void)
     lv_obj_align(s_date, LV_ALIGN_CENTER, 0, -130);
 
     s_whale = pet_create(scr);
-    lv_image_set_scale(s_whale, 300);   /* 156 px at 117%: she's the home screen */
-    lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -22);
+    lv_image_set_scale(s_whale, 270);   /* 156 px at 105%: she's the home screen */
+    lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -26);
+
+    /* The week's check-ins under her: a lit dot for each day with learning. */
+    for (int i = 0; i < 7; i++) {
+        int d = i == 6 ? 11 : 8;
+        s_dots[i] = lv_obj_create(scr);
+        lv_obj_remove_style_all(s_dots[i]);
+        lv_obj_set_size(s_dots[i], d, d);
+        lv_obj_set_style_radius(s_dots[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(s_dots[i], 1, 0);
+        lv_obj_set_style_border_color(s_dots[i], lv_color_hex(0xd9823c), 0);
+        lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(0xd9823c), 0);
+        lv_obj_align(s_dots[i], LV_ALIGN_CENTER, (i - 3) * 20, 72);
+        lv_obj_remove_flag(s_dots[i], LV_OBJ_FLAG_CLICKABLE);
+    }
     lv_obj_add_flag(s_whale, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_whale, on_whale_tap, LV_EVENT_CLICKED, NULL);   /* she reacts; 小鲸 below opens chat */
     pet_play(s_whale, PET_WAVE, false);   /* hello */
 
-    /* Three buttons standing on their own (the dock panel behind them looked boxed in). */
-    lv_obj_t *b = app(scr, -92, 112, 0x2f5bea, "小鲸", go_chat);
+    /* The apps: pages of four, swiped sideways, a dot for each page below. */
+    lv_obj_t *dock = lv_obj_create(scr);
+    lv_obj_remove_style_all(dock);
+    lv_obj_set_size(dock, 466, 112);
+    lv_obj_align(dock, LV_ALIGN_CENTER, 0, 128);
+    lv_obj_set_flex_flow(dock, LV_FLEX_FLOW_ROW);
+    lv_obj_set_scroll_dir(dock, LV_DIR_HOR);
+    lv_obj_set_scroll_snap_x(dock, LV_SCROLL_SNAP_CENTER);
+    lv_obj_add_flag(dock, LV_OBJ_FLAG_SCROLL_ONE);
+    lv_obj_set_scrollbar_mode(dock, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(dock, on_dock_scroll, LV_EVENT_SCROLL_END, NULL);
+    lv_obj_t *p1 = page(dock), *p2 = page(dock);
+
+    lv_obj_t *b = app(p1, -138, 0x2f5bea, "小鲸", go_chat);
     lv_obj_t *icon = lv_image_create(b);
     lv_image_set_src(icon, &whale_img);
     lv_image_set_scale(icon, 110);   /* 136 px at 43%: 58 px */
     lv_obj_center(icon);
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+    b = app(p1, -46, 0xd9823c, "古诗", go_poem);
+    lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "诗"));
+    b = app(p1, 46, 0x2e9e6b, "背诗", go_recite);
+    lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "背"));
+    b = app(p1, 138, 0x8a5cf6, "单词", go_words);
+    lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, "Aa"));
+    b = app(p2, -138, 0x3a4256, "设置", go_settings);
+    lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, LV_SYMBOL_SETTINGS));
 
-    b = app(scr, 0, 112, 0xd9823c, "古诗", go_poem);
-    lv_obj_t *l = ui_label(b, &g_font_poem, 0xffffff, "诗");
-    lv_obj_center(l);
-
-    b = app(scr, 92, 112, 0x3a4256, "设置", go_settings);
-    l = ui_label(b, &lv_font_montserrat_28, 0xffffff, LV_SYMBOL_SETTINGS);
-    lv_obj_center(l);
+    for (int i = 0; i < 2; i++) {
+        s_page_dots[i] = lv_obj_create(scr);
+        lv_obj_remove_style_all(s_page_dots[i]);
+        lv_obj_set_size(s_page_dots[i], 6, 6);
+        lv_obj_set_style_radius(s_page_dots[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(s_page_dots[i], LV_OPA_COVER, 0);
+        lv_obj_align(s_page_dots[i], LV_ALIGN_CENTER, (i ? 6 : -6), 196);
+    }
+    show_page_dot(0);
 
     lv_obj_add_event_cb(scr, on_delete, LV_EVENT_DELETE, NULL);
     s_scr = scr;

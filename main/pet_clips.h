@@ -21,5 +21,9 @@ typedef enum {
     PET_CHEER,
     PET_SIGH,
     PET_SLEEP,
+    PET_EAT_RICE,
+    PET_EAT_SNACK,
+    PET_EAT_MELON,
+    PET_HUNGRY,
     PET_CLIP_COUNT,
 } pet_clip_t;

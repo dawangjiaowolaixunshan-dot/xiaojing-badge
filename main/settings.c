@@ -1,5 +1,6 @@
 #include "settings.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -60,18 +61,28 @@ bool settings_set_key(key_id_t id, const char *value)
     return id < KEY_COUNT && set_str(KEY_NAMES[id], value);
 }
 
-/* Slot 0 is the home network, slot 1 the phone hotspot. */
-static const char *SSID_KEY[2] = {"ssid", "ssid2"};
-static const char *PASS_KEY[2] = {"pass", "pass2"};
+/* Up to WIFI_SLOTS networks. Slot 0 was "home" and slot 1 "the phone
+ * hotspot" (keys ssid/pass and ssid2/pass2, kept as they were); the rest are
+ * ssid3/pass3 .. ssid8/pass8. */
+static void wifi_keys(int slot, char *sk, char *pk)
+{
+    if (slot == 0) {
+        strcpy(sk, "ssid");
+        strcpy(pk, "pass");
+    } else {
+        sprintf(sk, "ssid%d", slot + 1);
+        sprintf(pk, "pass%d", slot + 1);
+    }
+}
 
 bool settings_get_wifi(int slot, char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
 {
+    char sk[8], pk[8];
     pass[0] = '\0';
-    if (slot < 0 || slot > 1) {
-        return false;
-    }
-    if (get_str(NS, SSID_KEY[slot], ssid, ssid_cap)) {
-        get_str(NS, PASS_KEY[slot], pass, pass_cap);
+    if (slot < 0 || slot >= WIFI_SLOTS) return false;
+    wifi_keys(slot, sk, pk);
+    if (get_str(NS, sk, ssid, ssid_cap)) {
+        get_str(NS, pk, pass, pass_cap);
         return true;
     }
     if (slot == 0 && get_str("homehub", "ssid", ssid, ssid_cap)) {   /* left by the Muse firmware */
@@ -83,10 +94,49 @@ bool settings_get_wifi(int slot, char *ssid, size_t ssid_cap, char *pass, size_t
 
 bool settings_set_wifi(int slot, const char *ssid, const char *pass)
 {
-    if (slot < 0 || slot > 1) {
-        return false;
+    char sk[8], pk[8];
+    if (slot < 0 || slot >= WIFI_SLOTS) return false;
+    wifi_keys(slot, sk, pk);
+    return set_str(sk, ssid) && set_str(pk, pass);
+}
+
+int settings_find_wifi(const char *ssid)
+{
+    char s[33], p[65];
+    for (int i = 0; i < WIFI_SLOTS; i++) {
+        if (settings_get_wifi(i, s, sizeof(s), p, sizeof(p)) && !strcmp(s, ssid)) {
+            memset(p, 0, sizeof(p));
+            return i;
+        }
     }
-    return set_str(SSID_KEY[slot], ssid) && set_str(PASS_KEY[slot], ssid[0] ? pass : "");
+    memset(p, 0, sizeof(p));
+    return -1;
+}
+
+int settings_add_wifi(const char *ssid, const char *pass)
+{
+    char s[33], p[65];
+    int slot = settings_find_wifi(ssid);   /* a known one: new password */
+    for (int i = 0; slot < 0 && i < WIFI_SLOTS; i++) {
+        if (!settings_get_wifi(i, s, sizeof(s), p, sizeof(p))) slot = i;
+    }
+    memset(p, 0, sizeof(p));
+    if (slot < 0) slot = WIFI_SLOTS - 1;   /* full: the last one makes way */
+    return settings_set_wifi(slot, ssid, pass) ? slot : -1;
+}
+
+void settings_forget_wifi(int slot)
+{
+    settings_set_wifi(slot, "", "");
+    if (slot == 0) {   /* and the network Muse saved, which slot 0 falls back to */
+        nvs_handle_t h;
+        if (nvs_open("homehub", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_key(h, "ssid");
+            nvs_erase_key(h, "password");
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
 }
 
 bool settings_get_blob(const char *name, void *out, size_t len)

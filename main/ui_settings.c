@@ -10,6 +10,7 @@
 #include "chat.h"
 #include "mic.h"
 #include "voices.h"
+#include "wifi_prov.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "net.h"
@@ -146,6 +147,94 @@ static void on_sleep(lv_event_t *e)
 }
 
 static void on_restart(lv_event_t *e) { esp_restart(); }
+
+/* ---- Wi-Fi: forget (tap twice), add from a phone ---- */
+
+static void on_forget_wifi(lv_event_t *e)
+{
+    lv_obj_t *b = lv_event_get_target(e);
+    lv_obj_t *l = lv_obj_get_child(b, 0);
+    if (strcmp(lv_label_get_text(l), "再点一次删除")) {   /* first tap: ask */
+        lv_label_set_text(l, "再点一次删除");
+        lv_obj_set_style_bg_color(b, lv_color_hex(C_RED), 0);
+        return;
+    }
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    settings_forget_wifi(slot);
+    if (slot == net_slot()) net_reconnect();
+    ui_settings();
+}
+
+static lv_obj_t *s_prov_lbl;
+
+static void prov_status(const char *text, bool done)
+{
+    ui_lock();
+    if (s_prov_lbl) lv_label_set_text(s_prov_lbl, text);
+    ui_unlock();
+}
+
+static void prov_timer(lv_timer_t *t)
+{
+    static int up_for;
+    if (!s_prov_lbl) {
+        up_for = 0;
+        return;
+    }
+    const char *now = lv_label_get_text(s_prov_lbl);
+    if (strstr(now, "正在连接") && net_up()) {
+        lv_label_set_text(s_prov_lbl, "连上了！");
+        up_for = 1;
+    } else if (up_for && ++up_for > 4) {   /* a moment to read it, then back */
+        up_for = 0;
+        s_prov_lbl = NULL;
+        ui_settings();
+    }
+}
+
+static void prov_back(void)
+{
+    s_prov_lbl = NULL;
+    prov_stop();
+    ui_settings();
+}
+
+static void on_add_wifi(lv_event_t *e)
+{
+    lv_obj_t *scr = ui_screen();
+    ui_back_button(scr);
+    lv_obj_t *t = ui_label(scr, &g_font_text, C_ACCENT, "添加 Wi-Fi");
+    lv_obj_align(t, LV_ALIGN_CENTER, 0, -190);
+    s_prov_lbl = ui_label(scr, &g_font_text, C_GREEN, "正在准备…");
+    lv_obj_set_width(s_prov_lbl, 330);
+    lv_label_set_long_mode(s_prov_lbl, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_align(s_prov_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_prov_lbl, LV_ALIGN_CENTER, 0, 170);
+    ui_show(scr, prov_back, NULL);
+    lv_refr_now(NULL);
+    if (!prov_start(prov_status)) {
+        lv_label_set_text(s_prov_lbl, "开不了热点，稍后再试");
+        return;
+    }
+    char qr[96], buf[160];
+    snprintf(qr, sizeof(qr), "WIFI:T:WPA;S:%s;P:%s;;", prov_ap_ssid(), prov_ap_pass());
+    lv_obj_t *code = lv_qrcode_create(scr);
+    lv_qrcode_set_size(code, 180);
+    lv_qrcode_set_dark_color(code, lv_color_black());
+    lv_qrcode_set_light_color(code, lv_color_white());
+    lv_qrcode_update(code, qr, strlen(qr));
+    lv_obj_set_style_border_color(code, lv_color_white(), 0);
+    lv_obj_set_style_border_width(code, 8, 0);
+    lv_obj_align(code, LV_ALIGN_CENTER, 0, -40);
+    memset(qr, 0, sizeof(qr));
+    snprintf(buf, sizeof(buf), "手机扫码连上吧唧，会弹出设置页\nWi-Fi：%s  密码：%s", prov_ap_ssid(), prov_ap_pass());
+    lv_obj_t *h = ui_label(scr, &g_font_text, C_TEXT, buf);
+    lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(h, LV_ALIGN_CENTER, 0, 92);
+    lv_label_set_text(s_prov_lbl, "没弹出来就打开 192.168.4.1");
+    static lv_timer_t *timer;
+    if (!timer) timer = lv_timer_create(prov_timer, 500, NULL);
+}
 
 /* ---- 认识声音: each of the family says a line once ---- */
 
@@ -295,20 +384,28 @@ void ui_settings(void)
     row_title("自动熄屏（点一下换）");
     pill(PREFS_SLEEP_NAMES[g_prefs.sleep], C_PANEL, on_sleep, &s_sleep_btn_lbl);
 
-    card("网络");
+    card("Wi-Fi");
     char ssid[33] = "", pass[65];
-    settings_get_wifi(net_slot(), ssid, sizeof(ssid), pass, sizeof(pass));
+    if (net_slot() >= 0) settings_get_wifi(net_slot(), ssid, sizeof(ssid), pass, sizeof(pass));
     memset(pass, 0, sizeof(pass));
     if (net_up()) {
-        esp_netif_ip_info_t ip = {0};
-        esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
-        snprintf(buf, sizeof(buf), "%s%s\n信号 %d · " IPSTR, ssid, net_slot() ? "（手机热点）" : "",
-                 net_rssi(), IP2STR(&ip.ip));
+        snprintf(buf, sizeof(buf), "已连上：%s\n信号 %d", ssid, net_rssi());
     } else {
-        snprintf(buf, sizeof(buf), "%s\n没有连上", ssid[0] ? ssid : "没设置 Wi-Fi");
+        snprintf(buf, sizeof(buf), "没有连上网络");
     }
     lv_obj_t *n = ui_label(s_cur, &g_font_text, C_TEXT, buf);
     lv_obj_set_style_text_align(n, LV_TEXT_ALIGN_CENTER, 0);
+    pill_ud(LV_SYMBOL_PLUS "  添加 Wi-Fi", 0x2f5bea, on_add_wifi, NULL);
+    bool any = false;
+    for (int i = 0; i < WIFI_SLOTS; i++) {
+        char sname[33];
+        if (!settings_get_wifi(i, sname, sizeof(sname), pass, sizeof(pass))) continue;
+        memset(pass, 0, sizeof(pass));
+        if (!any) row_title("记住的网络（点一下删除）");
+        any = true;
+        snprintf(buf, sizeof(buf), "%s  " LV_SYMBOL_CLOSE, sname);
+        pill_ud(buf, C_PANEL, on_forget_wifi, (void *)(intptr_t)i);
+    }
 
     card(NULL);
     pill("重启", C_PANEL, on_restart, NULL);
@@ -316,3 +413,5 @@ void ui_settings(void)
 
     ui_show(scr, ui_home, NULL);
 }
+
+void ui_wifi_add(void) { on_add_wifi(NULL); }

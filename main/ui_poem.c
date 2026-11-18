@@ -10,6 +10,7 @@
 
 #include "esp_random.h"
 #include "poems.h"
+#include "care.h"
 #include "prefs.h"
 #include "tts.h"
 #include "ui.h"
@@ -173,7 +174,10 @@ static void poem_timer(lv_timer_t *t)
     int k = tts_sentence_now();
     if (k >= 0) s_reading_started = true;
     if (k >= 2 && k - 2 != s_active) set_active(k - 2, LV_ANIM_ON);
-    if (s_reading_started && !tts_active()) show_read(false);   /* finished */
+    if (s_reading_started && !tts_active()) {   /* finished: reading a poem through counts */
+        show_read(false);
+        care_feed(10);
+    }
 }
 
 static void on_gesture(lv_event_t *e)
@@ -272,3 +276,5 @@ void ui_poem_read(void)   /* 朗读, over USB for testing */
 {
     if (s_scr) on_read(NULL);
 }
+
+int ui_poem_current(void) { return s_order ? s_order[s_pos] : -1; }

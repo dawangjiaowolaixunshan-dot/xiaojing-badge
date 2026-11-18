@@ -119,8 +119,8 @@ static void handle(char *line)
                settings_get_key(KEY_DEEPSEEK, v, CMD_LINE_MAX) ? "set" : "unset",
                settings_get_key(KEY_BAILIAN, v, CMD_LINE_MAX) ? "set" : "unset",
                settings_get_wifi(0, v, 33, pass, sizeof(pass)) ? "set" : "unset",
-               settings_get_wifi(1, v, 33, pass, sizeof(pass)) ? "set" : "unset",
-               !net_up() ? "down" : net_slot() ? "hotspot" : "home");
+               settings_get_wifi(1, v, 33, pass, sizeof(pass)) ? "set" : "unset",   /* the first two of WIFI_SLOTS */
+               !net_up() ? "down" : "up");
         wipe(v, CMD_LINE_MAX);
         wipe(pass, sizeof(pass));
         free(v);
@@ -155,6 +155,9 @@ static void handle(char *line)
         if (!strcmp(line + 7, "chat")) ui_chat();
         else if (!strcmp(line + 7, "settings")) ui_settings();
         else if (!strcmp(line + 7, "poem")) ui_poem_home();
+        else if (!strcmp(line + 7, "recite")) ui_recite();
+        else if (!strcmp(line + 7, "wifiadd")) ui_wifi_add();
+        else if (!strcmp(line + 7, "words")) ui_words();
         else ui_home();
         ui_unlock();
         printf("@ok screen\n");
@@ -199,6 +202,16 @@ static void handle(char *line)
         }
         printf("@shot_end\n");
         lv_draw_buf_destroy(snap);
+    } else if (!strncmp(line, "word=", 5)) {   /* as if read aloud */
+        ui_lock();
+        ui_words_inject(line + 5);
+        ui_unlock();
+        printf("@ok word\n");
+    } else if (!strncmp(line, "recite=", 7)) {
+        ui_lock();
+        ui_recite_inject(line + 7);
+        ui_unlock();
+        printf("@ok recite\n");
     } else if (!strcmp(line, "poemread")) {
         ui_lock();
         ui_poem_read();
