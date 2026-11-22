@@ -149,13 +149,19 @@ static void update_status(void)
     int pct;
     bool charging, usb;
     pmu_read(&pct, &charging, &usb);
-    char batt[24] = "", wx[40] = "";
-    if (charging) snprintf(batt, sizeof(batt), "  " LV_SYMBOL_CHARGE);   /* the level is the ring */
+    char batt[24] = "", wx[36] = "";
+    if (pct >= 0) snprintf(batt, sizeof(batt), " %d%%%s", pct, charging ? LV_SYMBOL_CHARGE : "");
+    else if (charging) snprintf(batt, sizeof(batt), " " LV_SYMBOL_CHARGE);
     weather_t w;
-    if (weather_get(&w)) snprintf(wx, sizeof(wx), "  %s %.0f°", weather_desc(w.code), w.temp);
+    if (weather_get(&w)) snprintf(wx, sizeof(wx), " %s%.0f°", weather_desc(w.code), w.temp);
     if (net_time_valid()) {
-        snprintf(buf, sizeof(buf), "%d月%d日 周%s%s%s%s", tm.tm_mon + 1, tm.tm_mday, WEEK[tm.tm_wday], wx, batt,
-                 net_up() ? "" : "  无网络");
+        if (wx[0]) {
+            snprintf(buf, sizeof(buf), "%d月%d日%s%s%s", tm.tm_mon + 1, tm.tm_mday, wx, batt,
+                     net_up() ? "" : " 无网");
+        } else {
+            snprintf(buf, sizeof(buf), "%d月%d日 周%s%s%s", tm.tm_mon + 1, tm.tm_mday, WEEK[tm.tm_wday], batt,
+                     net_up() ? "" : " 无网");
+        }
     } else {
         snprintf(buf, sizeof(buf), "%s%s", net_up() ? "对时中…" : "连接网络中…", batt);
     }
@@ -167,7 +173,7 @@ static void update_status(void)
 
 static void home_timer(lv_timer_t *t)
 {
-    if (!s_scr) return;
+    if (!s_scr || !ui_screen_on()) return;
     uint32_t now = lv_tick_get();
     static uint32_t last_status;
     if (now - last_status > 1000) {
@@ -339,12 +345,12 @@ void ui_home(void)
     lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "诗"));
     b = app(p1, 46, 0x2e9e6b, "背诗", go_recite);
     lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "背"));
-    b = app(p1, 138, 0x8a5cf6, "单词", go_words);
-    lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, "Aa"));
-    b = app(p2, -138, 0xe0563b, "口算", go_math);
-    lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "算"));
-    b = app(p2, -46, 0x3a4256, "设置", go_settings);
+    b = app(p1, 138, 0x3a4256, "设置", go_settings);
     lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, LV_SYMBOL_SETTINGS));
+    b = app(p2, -56, 0x8a5cf6, "单词", go_words);
+    lv_obj_center(ui_label(b, &lv_font_montserrat_28, 0xffffff, "Aa"));
+    b = app(p2, 56, 0xe0563b, "口算", go_math);
+    lv_obj_center(ui_label(b, &g_font_poem, 0xffffff, "算"));
 
     for (int i = 0; i < 2; i++) {
         s_page_dots[i] = lv_obj_create(scr);

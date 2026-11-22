@@ -125,7 +125,7 @@ void app_main(void)
         ESP_LOGE(TAG, "no microphone: DeepSeek can't listen");
     }
     tts_init();
-    prefs_apply();   /* again now the speaker is up: its volume */
+    tts_set_volume(g_prefs.volume);   /* speaker came up after ui_start(); don't touch display QSPI without ui_lock */
     xTaskCreate(button_task, "buttons", 3072, NULL, 4, NULL);
     xTaskCreate(heartbeat_task, "heartbeat", 3072, NULL, 1, NULL);
     ESP_LOGI(TAG, "up");

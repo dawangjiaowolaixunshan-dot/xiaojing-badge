@@ -117,7 +117,11 @@ static void words_talk(bool down)
             return;
         }
         tts_stop();
-        if (!asr_begin_lang(on_heard, "\"en\"")) return;
+        if (!asr_begin_lang(on_heard, "\"en\"")) {
+            lv_label_set_text(s_result, "稍等一下再读");
+            lv_obj_set_style_text_color(s_result, lv_color_hex(C_DIM), 0);
+            return;
+        }
         s_listening = true;
         lv_label_set_text(s_hint, "正在听…读完松开");
         pet_play(s_whale, PET_LISTEN, true);
@@ -139,6 +143,7 @@ static void on_skip(lv_event_t *e)
 {
     if (s_listening || s_busy || s_pos >= s_n) return;
     tts_stop();
+    s_next_at = 0;
     words_mark(s_set[s_pos], false);   /* skipped: back tomorrow */
     s_pos++;
     show_card();
@@ -172,8 +177,9 @@ static void on_delete(lv_event_t *e)
 {
     if (lv_event_get_target(e) != s_scr) return;
     tts_stop();
-    if (s_listening) asr_cancel();
+    if (s_listening || s_busy) asr_cancel();
     s_listening = s_busy = false;
+    s_next_at = 0;
     s_scr = s_whale = NULL;
 }
 
@@ -187,6 +193,7 @@ void ui_words(void)
     lv_image_set_scale(s_whale, 128);
     lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -192);
     pet_play(s_whale, PET_IDLE, true);
+    ui_volume_button(s_scr);
     s_after = PET_IDLE;
 
     s_count = ui_label(s_scr, &g_font_text, C_DIM, "");

@@ -13,9 +13,12 @@ typedef enum { VOICE_CHILD, VOICE_DAD, VOICE_MOM, VOICE_COUNT, VOICE_UNKNOWN = -
 #define VOICE_ENROLL_SENTENCES 3
 
 void voices_init(void);
+bool voices_enabled(void);
+void voices_set_enabled(bool on);
 int voices_enrolled_hz(voice_who_t who);        /* 0 when not recorded */
 int voices_enrolled_n(voice_who_t who);         /* sentences recorded with timbre (0: none, or pitch only) */
 void voices_reset(voice_who_t who);
+void voices_reset_all(void);
 void voices_enroll(voice_who_t who, const voice_sample_t *s);
 /* The best match, or VOICE_UNKNOWN. Logged to /hist/voice.csv for tuning. */
 voice_who_t voices_classify(const voice_sample_t *s);

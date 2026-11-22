@@ -115,17 +115,65 @@ static void handle(char *line)
         wipe(tab + 1, strlen(tab + 1));
         printf("@%s %s\n", ok ? "ok" : "fail", tag);
         if (ok) {
-            net_reconnect();
+            net_join(slot);
         }
+    } else if (!strncmp(line, "wifi_add=", 9)) {
+        char *ssid = line + 9, *tab = strchr(ssid, '\t');
+        if (!tab) {
+            printf("@fail wifi_add (ssid<TAB>password)\n");
+            return;
+        }
+        *tab = '\0';
+        int slot = settings_add_wifi(ssid, tab + 1);
+        wipe(tab + 1, strlen(tab + 1));
+        printf("@%s wifi_add slot=%d\n", slot >= 0 ? "ok" : "fail", slot);
+        if (slot >= 0) net_join(slot);
+    } else if (!strncmp(line, "wifi_del=", 9)) {
+        int slot = atoi(line + 9);
+        if (slot >= 0 && slot < WIFI_SLOTS) {
+            settings_forget_wifi(slot);
+            if (slot == net_slot()) net_reconnect();
+            printf("@ok wifi_del %d\n", slot);
+        } else {
+            printf("@fail wifi_del\n");
+        }
+    } else if (!strcmp(line, "wifi_list")) {
+        char ssid[33], pass[65], st[128];
+        int cnt = 0;
+        for (int i = 0; i < WIFI_SLOTS; i++) {
+            if (settings_get_wifi(i, ssid, sizeof(ssid), pass, sizeof(pass))) {
+                printf("@wifi %d %s%s\n", i, ssid, (net_up() && net_slot() == i) ? " [connected]" : "");
+                cnt++;
+            }
+        }
+        wipe(pass, sizeof(pass));
+        net_status_text(st, sizeof(st));
+        for (char *p = st; *p; p++) if (*p == '\n') *p = ' ';
+        printf("@wifi_end %d active=%d state=%d reason=%d status=%s\n", cnt, net_slot(), (int)net_state(),
+               net_last_reason(), st);
+    } else if (!strcmp(line, "wifi_scan")) {
+        net_ap_t *aps = heap_caps_calloc(16, sizeof(net_ap_t), MALLOC_CAP_SPIRAM);
+        int n = aps ? net_scan(aps, 16) : 0;
+        for (int i = 0; i < n; i++) {
+            printf("@ap %d %s %d %s\n", (int)aps[i].rssi, aps[i].secured ? "sec" : "open", (int)aps[i].saved_slot,
+                   aps[i].ssid);
+        }
+        free(aps);
+        printf("@ap_end %d\n", n);
     } else if (!strcmp(line, "keys?")) {
         char *v = heap_caps_malloc(CMD_LINE_MAX, MALLOC_CAP_SPIRAM);
         char pass[65];
         if (!v) return;
-        printf("@keys ds_key=%s bl_key=%s wifi=%s wifi2=%s net=%s\n",
+        int wcnt = 0;
+        for (int i = 0; i < WIFI_SLOTS; i++) {
+            if (settings_get_wifi(i, v, 33, pass, sizeof(pass))) wcnt++;
+        }
+        printf("@keys ds_key=%s bl_key=%s wifi=%s wifi2=%s wifi_n=%d net=%s\n",
                settings_get_key(KEY_DEEPSEEK, v, CMD_LINE_MAX) ? "set" : "unset",
                settings_get_key(KEY_BAILIAN, v, CMD_LINE_MAX) ? "set" : "unset",
                settings_get_wifi(0, v, 33, pass, sizeof(pass)) ? "set" : "unset",
-               settings_get_wifi(1, v, 33, pass, sizeof(pass)) ? "set" : "unset",   /* the first two of WIFI_SLOTS */
+               settings_get_wifi(1, v, 33, pass, sizeof(pass)) ? "set" : "unset",
+               wcnt,
                !net_up() ? "down" : "up");
         wipe(v, CMD_LINE_MAX);
         wipe(pass, sizeof(pass));
@@ -203,6 +251,8 @@ static void handle(char *line)
         else if (!strcmp(line + 7, "poem")) ui_poem_home();
         else if (!strcmp(line + 7, "recite")) ui_recite();
         else if (!strcmp(line + 7, "wifiadd")) ui_wifi_add();
+        else if (!strcmp(line + 7, "wifiscan")) ui_wifi_scan();
+        else if (!strcmp(line + 7, "wifipass")) ui_wifi_pass_test("iPhone 热点");
         else if (!strcmp(line + 7, "words")) ui_words();
         else if (!strcmp(line + 7, "math")) ui_math();
         else ui_home();
@@ -216,6 +266,13 @@ static void handle(char *line)
             tts_set_voice(PREFS_VOICES[i]);
         }
         printf("@ok chatvoice %d\n", i);
+    } else if (!strncmp(line, "poemvoice=", 10)) {   /* pick poem voice by index */
+        int i = atoi(line + 10);
+        if (i >= 0 && i < PREFS_VOICE_N) {
+            g_prefs.poem_voice = (uint8_t)i;
+            prefs_save();
+        }
+        printf("@ok poemvoice %d\n", i);
     } else if (!strncmp(line, "voicetest=", 10)) {   /* speak a line in voice N, to check the id works */
         int i = atoi(line + 10);
         if (i >= 0 && i < PREFS_VOICE_N) tts_say_with(PREFS_VOICES[i], "你好");
@@ -285,6 +342,26 @@ static void handle(char *line)
         lv_display_trigger_activity(NULL);
         ui_unlock();
         printf("@ok wake\n");
+    } else if (!strncmp(line, "vol=", 4)) {
+        int v = atoi(line + 4);
+        if (ui_lock()) {
+            ui_volume_apply(v, true);
+            ui_unlock();
+        }
+        printf("@ok vol %d\n", (int)g_prefs.volume);
+    } else if (!strcmp(line, "volui")) {
+        if (ui_lock()) {
+            if (ui_volume_is_open()) ui_volume_close();
+            else ui_volume_popup();
+            ui_unlock();
+        }
+        printf("@ok volui\n");
+    } else if (!strncmp(line, "swipepreview=", 13)) {
+        if (ui_lock()) {
+            ui_swipe_preview(atoi(line + 13));
+            ui_unlock();
+        }
+        printf("@ok swipepreview\n");
     } else if (!strcmp(line, "powerdump")) {   /* "@pw <line>" each, then "@pw_end" */
         power_dump(power_line);
         printf("@pw_end\n");

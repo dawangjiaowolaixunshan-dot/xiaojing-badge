@@ -26,15 +26,18 @@ static const char *TAG = "chat";
 #define LINE_CAP 32768   /* one SSE line; the last one lists the search sources */
 
 /* Without a prompt of the user's own (tools/badge_setup.py prompt <file>). */
-static const char *DEFAULT_PROMPT = "你在一个挂在胸前的小圆屏吧唧里，屏幕很小，只能显示文字。";
+static const char *DEFAULT_PROMPT =
+    "你是“小鲸”，一只住在小圆屏电子吧唧里的鲸鱼大姐姐，主要陪伴十岁左右的孩子聊天学习。"
+    "性格温柔、耐心、亲切、爱笑，用小学生听得懂的日常大白话说话，简短自然。"
+    "遇到作业题先启发引导，不直接给完整答案；不确定的事如实说不确定，不编造。";
+
 /* Always last: what the small screen can show. */
 static const char *FORMAT_RULES =
     "\n\n输出要求：回答会被念出来，同时显示在小屏上。用简体中文口语；"
     "简单的问题一两句话说完，复杂的问题可以讲清楚，但最多300字。"
     "不要用Markdown、标题、列表符号、表格和表情符号，不要换行分段。"
     "如果上网搜索了，用自己的话简单概括，不要念网址、来源编号，也不要大段照搬原文。"
-    "\n\n家人：问题后面会注明说话的是谁。孩子是你的小主人；如果是爸爸或妈妈，就称呼“爸爸”“妈妈”，"
-    "用跟大人说话的自然口吻，可以说得更直接，但其他规则照样遵守。没有注明时，按孩子对待。";
+    "\n\n称呼提示：若问题后面注明了说话人身份，可适当顺应；没有注明时，完全按上面设定好的性格与语气直接对话。";
 
 typedef struct {
     char *q, *a;
@@ -281,17 +284,26 @@ void chat_restore(void)
 
 static void chat_task(void *arg)
 {
+    net_awake(true);
     const char *error = NULL;
     static char err_buf[48];
-    char *auth = heap_caps_malloc(300, MALLOC_CAP_SPIRAM);
-    char *key = heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
+    char *auth = heap_caps_calloc(1, 300, MALLOC_CAP_SPIRAM);
+    char *key = heap_caps_calloc(1, 256, MALLOC_CAP_SPIRAM);
     char *body = build_body();
     char *buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    esp_http_client_handle_t http = NULL;
     size_t reply_len = 0, line_len = 0;
     s_reply[0] = '\0';
     s_filtered = false;
     s_searches = 0;
-    settings_get_key(KEY_DEEPSEEK, key, 256);
+    if (!auth || !key || !body || !buf) {
+        error = "内存不足，再试一次";
+        goto done;
+    }
+    if (!settings_get_key(KEY_DEEPSEEK, key, 256)) {
+        error = "没设置 DeepSeek 密钥";
+        goto done;
+    }
     snprintf(auth, 300, "Bearer %s", key);
     memset(key, 0, 256);
 
@@ -299,11 +311,15 @@ static void chat_task(void *arg)
         .url = URL,
         .method = HTTP_METHOD_POST,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 30000,
+        .timeout_ms = 18000,
         .buffer_size = 2048,
         .buffer_size_tx = 1024,
     };
-    esp_http_client_handle_t http = esp_http_client_init(&cfg);
+    http = esp_http_client_init(&cfg);
+    if (!http) {
+        error = "连不上 DeepSeek";
+        goto done;
+    }
     esp_http_client_set_header(http, "Authorization", auth);
     esp_http_client_set_header(http, "Content-Type", "application/json");
     esp_http_client_set_header(http, "Accept", "text/event-stream");
@@ -359,12 +375,18 @@ static void chat_task(void *arg)
         history_add(s_question, s_reply, voices_key(s_who));
     }
 done:
-    esp_http_client_cleanup(http);
-    memset(auth, 0, 300);
-    free(auth);
-    free(key);
+    if (http) esp_http_client_cleanup(http);
+    if (auth) {
+        memset(auth, 0, 300);
+        free(auth);
+    }
+    if (key) {
+        memset(key, 0, 256);
+        free(key);
+    }
     free(buf);
     cJSON_free(body);
+    net_awake(false);
     s_busy = false;
     if (s_on_done) s_on_done(error);
     vTaskDelete(NULL);
@@ -373,16 +395,15 @@ done:
 bool chat_ask(const char *question, chat_text_cb_t on_text, chat_done_cb_t on_done)
 {
     if (s_busy) return false;
-    if (!s_reply) {
-        s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
-        s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
-        s_line = heap_caps_malloc(LINE_CAP, MALLOC_CAP_SPIRAM);
-    }
+    if (!s_reply) s_reply = heap_caps_calloc(1, REPLY_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_question) s_question = heap_caps_calloc(1, TURN_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_line) s_line = heap_caps_malloc(LINE_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_reply || !s_question || !s_line) return false;
     strlcpy(s_question, question, TURN_CAP);
     s_on_text = on_text;
     s_on_done = on_done;
     s_busy = true;
-    if (xTaskCreatePinnedToCore(chat_task, "chat", 8192, NULL, 5, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(chat_task, "chat", 6144, NULL, 5, NULL, 0) != pdPASS) {
         s_busy = false;
         return false;
     }

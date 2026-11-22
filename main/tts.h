@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 
 /*
  * Speaking replies with Alibaba Cloud Bailian CosyVoice (cosyvoice-v2) over
@@ -20,3 +21,6 @@ void tts_say(const char *text);           /* stop what's playing and speak this,
 void tts_say_with(const char *voice, const char *text);   /* ...in this voice (voice samples, poems); \x1e splits sentences */
 void tts_set_volume(int pct);
 int tts_sentence_now(void);   /* which sentence of what's playing is being heard (0-based), -1 when none */
+uint32_t tts_played_ms(void); /* milliseconds of audio already sent to the speaker for current utterance */
+uint32_t tts_total_ms(void);  /* exact total duration in ms once cloud synthesis finishes, else 0 */
+bool tts_failed(void);        /* true if the current/last synthesis failed */

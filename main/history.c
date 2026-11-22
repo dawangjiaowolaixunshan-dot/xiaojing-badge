@@ -57,8 +57,18 @@ static int count_lines(void)
 {
     FILE *f = fopen(PATH, "r");
     if (!f) return 0;
-    int n = 0, c;
-    while ((c = fgetc(f)) != EOF) n += c == '\n';
+    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+    int n = 0;
+    if (buf) {
+        size_t got;
+        while ((got = fread(buf, 1, 2048, f)) > 0) {
+            for (size_t i = 0; i < got; i++) n += buf[i] == '\n';
+        }
+        free(buf);
+    } else {
+        int c;
+        while ((c = fgetc(f)) != EOF) n += c == '\n';
+    }
     fclose(f);
     return n;
 }

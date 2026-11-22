@@ -58,6 +58,7 @@ static int http_get(const char *url, char *body, int cap)
         .buffer_size = 2048,
     };
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    if (!h) return -1;
     int n = -1;
     if (esp_http_client_open(h, 0) == ESP_OK) {
         esp_http_client_fetch_headers(h);
@@ -125,6 +126,7 @@ static bool fetch(const loc_t *loc, char *body)
 static void weather_task(void *arg)
 {
     char *body = heap_caps_malloc(BODY_CAP, MALLOC_CAP_SPIRAM);
+    if (!body) vTaskDelete(NULL);
     loc_t loc = {0};
     bool have_loc = settings_get_blob("loc", &loc, sizeof(loc));
     for (;;) {
@@ -143,7 +145,7 @@ static void weather_task(void *arg)
 void weather_start(void)
 {
     s_mu = xSemaphoreCreateMutex();
-    xTaskCreate(weather_task, "weather", 6144, NULL, 2, NULL);
+    xTaskCreate(weather_task, "weather", 5120, NULL, 2, NULL);
 }
 
 bool weather_get(weather_t *out)

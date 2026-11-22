@@ -42,7 +42,9 @@ static void power_task(void *arg)
 
 void power_start(void)
 {
-    xTaskCreate(power_task, "power", 3072, NULL, 1, NULL);
+    /* Avoid writing /hist/power.csv every 60 s to protect SPIFFS flash endurance. */
+    (void)power_task;
+    ESP_LOGI(TAG, "power log paused to save flash");
 }
 
 void power_dump(void (*line_fn)(const char *line))

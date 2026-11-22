@@ -13,6 +13,7 @@ static const char *TAG = "voices";
 #define LOG_MAX (200 * 1024)
 
 static voice_tmpl_t s_t[VOICE_COUNT];
+static bool s_enabled;
 
 static void save(void) { settings_set_blob("vprint", s_t, sizeof(s_t)); }
 
@@ -24,8 +25,19 @@ void voices_init(void)
         if (settings_get_blob("voices", hz, sizeof(hz)))
             for (int i = 0; i < VOICE_COUNT; i++) s_t[i].hz = hz[i];
     }
-    ESP_LOGI(TAG, "child %d Hz/%d, dad %d Hz/%d, mom %d Hz/%d", s_t[0].hz, s_t[0].n, s_t[1].hz, s_t[1].n,
-             s_t[2].hz, s_t[2].n);
+    uint8_t on = 0;
+    if (settings_get_blob("vp_on", &on, 1)) s_enabled = on != 0;
+    ESP_LOGI(TAG, "vp=%s child %d Hz/%d, dad %d Hz/%d, mom %d Hz/%d", s_enabled ? "on" : "off", s_t[0].hz, s_t[0].n,
+             s_t[1].hz, s_t[1].n, s_t[2].hz, s_t[2].n);
+}
+
+bool voices_enabled(void) { return s_enabled; }
+
+void voices_set_enabled(bool on)
+{
+    s_enabled = on;
+    uint8_t v = on ? 1 : 0;
+    settings_set_blob("vp_on", &v, 1);
 }
 
 int voices_enrolled_hz(voice_who_t who) { return who >= 0 && who < VOICE_COUNT ? s_t[who].hz : 0; }
@@ -36,6 +48,13 @@ void voices_reset(voice_who_t who)
     if (who < 0 || who >= VOICE_COUNT) return;
     memset(&s_t[who], 0, sizeof(s_t[who]));
     save();
+}
+
+void voices_reset_all(void)
+{
+    memset(s_t, 0, sizeof(s_t));
+    save();
+    ESP_LOGI(TAG, "all voiceprints cleared");
 }
 
 void voices_enroll(voice_who_t who, const voice_sample_t *s)
@@ -69,6 +88,7 @@ static void log_line(const voice_sample_t *s, const float *sc, voice_who_t who)
 
 voice_who_t voices_classify(const voice_sample_t *s)
 {
+    if (!s_enabled) return VOICE_UNKNOWN;
     float sc[VOICE_COUNT];
     int best = vp_classify(s_t, VOICE_COUNT, s, sc);
     voice_who_t who = best < 0 ? VOICE_UNKNOWN : (voice_who_t)best;

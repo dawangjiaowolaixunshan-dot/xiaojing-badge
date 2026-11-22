@@ -83,6 +83,29 @@ static void render_line(int li, int *base)
     lv_spangroup_refresh(sg);
 }
 
+static void row_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
+static void animate_rows_cascade(void)
+{
+    const poem_t *w = poems_get(s_poem);
+    for (int i = 0; i < w->nlines; i++) {
+        lv_anim_delete(s_rows[i], row_opa_cb);
+        lv_obj_set_style_opa(s_rows[i], LV_OPA_TRANSP, 0);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_rows[i]);
+        lv_anim_set_exec_cb(&a, row_opa_cb);
+        lv_anim_set_values(&a, 0, 255);
+        lv_anim_set_delay(&a, (uint32_t)(i * 55));
+        lv_anim_set_duration(&a, 280);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    }
+}
+
 static void render(void)
 {
     const poem_t *w = poems_get(s_poem);
@@ -112,6 +135,7 @@ static void finish(const char *heard)
     recite_score(joined, heard ? heard : "", &s_res);
     s_scored = true;
     render();
+    animate_rows_cascade();
     int pct = s_res.n ? s_res.right * 100 / s_res.n : 0;
     int stars = pct >= 95 ? 3 : pct >= 80 ? 2 : pct >= 60 ? 1 : 0;
     char buf[80];
@@ -187,6 +211,7 @@ static void on_hint(lv_event_t *e)
     s_scored = false;
     s_hint = s_hint < 2 ? s_hint + 1 : 0;
     render();
+    animate_rows_cascade();
 }
 
 static void on_next(lv_event_t *e)
@@ -217,6 +242,7 @@ static void build(void)
     lv_image_set_scale(s_whale, 128);
     lv_obj_align(s_whale, LV_ALIGN_CENTER, 0, -192);
     pet_play(s_whale, PET_IDLE, true);
+    ui_volume_button(s_scr);
 
     char buf[96];
     snprintf(buf, sizeof(buf), "%s · %s %s", w->title, w->dynasty, w->author);
@@ -241,6 +267,7 @@ static void build(void)
         lv_obj_set_style_text_font(s_rows[i], &g_font_poem, 0);
     }
     render();
+    animate_rows_cascade();
 
     s_status = ui_label(s_scr, &g_font_text, C_DIM, "按住 PWR，把这首诗背给小鲸听");
     lv_obj_align(s_status, LV_ALIGN_CENTER, 0, 146);
@@ -261,7 +288,8 @@ static void recite_timer(lv_timer_t *t)
 static void on_delete(lv_event_t *e)
 {
     if (lv_event_get_target(e) != s_scr) return;
-    if (s_listening) asr_cancel();
+    tts_stop();
+    if (s_listening || s_busy) asr_cancel();
     s_listening = s_busy = false;
     s_scr = s_whale = s_status = s_list = NULL;
 }

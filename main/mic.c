@@ -15,7 +15,9 @@
 #include "mfcc.h"
 
 static const char *TAG = "mic";
-#define BLOCK 320           /* 20 ms */
+#define BLOCK 320                   /* 20 ms at 16 kHz (MIC_RATE) */
+#define HW_RATIO (AUDIO_HW_RATE / MIC_RATE)   /* 3: 48 kHz -> 16 kHz */
+#define HW_BLOCK (BLOCK * HW_RATIO) /* 960 stereo frames = 20 ms at 48 kHz */
 #define GAIN_DB 30.0f
 
 static esp_codec_dev_handle_t s_mic, s_spk;
@@ -47,20 +49,25 @@ static void voice_block(const int16_t *cur)
 
 static void mic_task(void *arg)
 {
-    int16_t *stereo = heap_caps_malloc(BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    int16_t *stereo = heap_caps_malloc(HW_BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     int16_t *mono = heap_caps_malloc(BLOCK * sizeof(int16_t), MALLOC_CAP_INTERNAL);
     for (;;) {
         if (!s_sink) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
-        if (esp_codec_dev_read(s_mic, stereo, BLOCK * 2 * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+        if (esp_codec_dev_read(s_mic, stereo, HW_BLOCK * 2 * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         int64_t sq = 0;
         for (int i = 0; i < BLOCK; i++) {
-            int v = (stereo[2 * i] + stereo[2 * i + 1]) / 2;
+            int b = i * HW_RATIO * 2;
+            int sum = 0;
+            for (int r = 0; r < HW_RATIO; r++) {
+                sum += (int)stereo[b + 2 * r] + (int)stereo[b + 2 * r + 1];
+            }
+            int v = sum / (HW_RATIO * 2);
             mono[i] = (int16_t)v;
             sq += (int64_t)v * v;
         }
@@ -77,7 +84,7 @@ static void mic_task(void *arg)
 bool mic_init(void)
 {
     const i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_RATE),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_HW_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = BSP_I2S_MCLK,
@@ -96,7 +103,7 @@ bool mic_init(void)
         ESP_LOGE(TAG, "ES7210 init failed");
         return false;
     }
-    esp_codec_dev_sample_info_t fs = {.sample_rate = MIC_RATE, .channel = 2, .bits_per_sample = 16};
+    esp_codec_dev_sample_info_t fs = {.sample_rate = AUDIO_HW_RATE, .channel = 2, .bits_per_sample = 16};
     if (esp_codec_dev_open(s_mic, &fs) != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "open mic failed");
         return false;
@@ -110,7 +117,7 @@ bool mic_init(void)
         esp_codec_dev_set_out_vol(s_spk, 75);
     }
     xTaskCreatePinnedToCore(mic_task, "mic", 4096, NULL, 6, &s_task, 1);
-    ESP_LOGI(TAG, "mic ready");
+    ESP_LOGI(TAG, "mic ready (I2S %d Hz -> mic %d Hz, tts %d Hz)", AUDIO_HW_RATE, MIC_RATE, TTS_RATE);
     return true;
 }
 
@@ -125,6 +132,8 @@ void mic_stop(void)
     s_sink = NULL;
     s_level = 0;
 }
+
+bool mic_active(void) { return s_sink != NULL; }
 
 int mic_level(void) { return s_level; }
 

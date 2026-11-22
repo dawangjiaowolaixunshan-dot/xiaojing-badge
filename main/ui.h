@@ -22,6 +22,7 @@ void ui_settings_changed(void);
 void ui_boot_button(bool pressed);   /* BOOT: back, on release */
 void ui_talk_button(bool pressed);
 bool ui_screen_on(void);
+void ui_set_brightness(int pct);
 void ui_prepare_deep_sleep(void);   /* PWR: hold to talk where a screen talks */
 
 /* Helpers for the screens (call with the lock held). */
@@ -30,7 +31,14 @@ void ui_show(lv_obj_t *scr, void (*back)(void), void (*talk)(bool pressed));
 lv_obj_t *ui_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color, const char *text);
 lv_obj_t *ui_button(lv_obj_t *parent, const char *text, const lv_font_t *font, int w, int h, uint32_t bg,
                     lv_event_cb_t cb, void *user);
-void ui_back_button(lv_obj_t *scr);
+void ui_swipe_edge_only(bool edge_only);
+void ui_swipe_preview(int dx);
+void ui_volume_button(lv_obj_t *scr);
+void ui_volume_popup(void);
+void ui_volume_close(void);
+bool ui_volume_is_open(void);
+void ui_volume_apply(int pct, bool save);
+void ui_settings_sync_volume(void);
 void ui_home(void);
 
 /* Screens. */
@@ -41,6 +49,9 @@ void ui_poem_read(void);
 int ui_poem_current(void);   /* the poem last shown in 古诗, -1 if none */
 void ui_recite(void);
 void ui_wifi_add(void);
+void ui_wifi_scan(void);
+void ui_wifi_pass_test(const char *ssid);
+bool ui_wifi_busy(void);
 void ui_words(void);
 void ui_words_inject(const char *heard);
 void ui_frames_reset(void);
