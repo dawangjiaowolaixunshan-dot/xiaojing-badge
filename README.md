@@ -119,7 +119,7 @@ idf.py -p /dev/cu.usbmodemXXXX app-flash
 
 ## 致谢与共同开发
 
-- **项目主导与硬件实测**：[@dlandwt-dotcom](https://github.com/dlandwt-dotcom)
+- **项目主导与硬件实测**：[@dawangjiaowolaixunshan-dot](https://github.com/dawangjiaowolaixunshan-dot)
 - **AI 协作开发**：Google Antigravity & Claude Code
 - 界面基于 [LVGL 9](https://lvgl.io/)，底层基于 [ESP-IDF](https://github.com/espressif/esp-idf)。
 - 欢迎参考、二次开发与交流反馈！
